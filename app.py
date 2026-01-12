@@ -3,6 +3,7 @@ import pandas as pd
 import json
 import time
 import os
+import gc
 from google import genai
 from google.genai import types
 from rapidfuzz import process, fuzz 
@@ -27,6 +28,8 @@ def get_client():
     return genai.Client(api_key=FIXED_API_KEY, http_options={'api_version': 'v1beta'})
 
 def safe_generate(client, prompt, response_schema=None):
+    if client is None:
+        return {"error": "API Key 未配置"}
     try:
         config = types.GenerateContentConfig(
             response_mime_type="application/json",
@@ -41,14 +44,18 @@ def safe_generate(client, prompt, response_schema=None):
     except Exception as e:
         return {"error": str(e)}
 
-@st.cache_data
+@st.cache_resource(show_spinner=False)
 def load_master_data():
-    """加载主数据，支持 xlsx 和 csv"""
+    """加载主数据，支持 xlsx 和 csv，带内存优化"""
     if os.path.exists(LOCAL_MASTER_FILE):
         try:
+            # 强制调用垃圾回收，释放旧内存
+            gc.collect()
+            
             # ✅ 根据后缀自动选择读取引擎
             if LOCAL_MASTER_FILE.endswith('.xlsx'):
-                df = pd.read_excel(LOCAL_MASTER_FILE)
+                # engine='openpyxl' 更稳定
+                df = pd.read_excel(LOCAL_MASTER_FILE, engine='openpyxl')
             else:
                 df = pd.read_csv(LOCAL_MASTER_FILE)
                 
@@ -63,7 +70,7 @@ def load_master_data():
             st.error(f"读取主数据文件出错: {e}")
             return pd.DataFrame()
     else:
-        st.error(f"⚠️ 未找到文件: {LOCAL_MASTER_FILE}。请确保该文件已上传到 GitHub 仓库的根目录。")
+        # 文件不存在时不报错，只返回空，在UI层提示
         return pd.DataFrame()
 
 def smart_map_columns(client, df_user, master_cols):
@@ -104,6 +111,7 @@ def ai_match_row(client, user_row, name_col, addr_col, candidates_df):
 
 # ================= 3. 页面 UI =================
 
+# 1. 先渲染 Header，确保 App 启动时有响应，防止 Health Check 失败
 st.markdown("""
     <style>
     .stApp {background-color: #F8F9FA;}
@@ -114,18 +122,19 @@ st.markdown("""
         border-radius: 5px; font-weight: bold; border-left: 5px solid #1976d2;
         margin: 10px 0; display: inline-block;
     }
-    .metric-badge {
-        background-color: #d1fae5; color: #065f46; padding: 4px 8px; border-radius: 4px; font-size: 0.8em; font-weight: bold;
-    }
     </style>
-    <div class="main-header">⚡ LinkMed 极速匹配 (Token Saver)</div>
+    <div class="main-header">⚡ LinkMed 极速匹配 (Pro)</div>
 """, unsafe_allow_html=True)
 
 client = get_client()
 
-# 加载主数据
-with st.spinner(f"正在加载 {LOCAL_MASTER_FILE}..."):
-    df_master = load_master_data()
+# 2. 延迟加载主数据 (防止启动超时)
+df_master = pd.DataFrame() # 初始化为空
+if os.path.exists(LOCAL_MASTER_FILE):
+    with st.spinner(f"正在加载主数据资源: {LOCAL_MASTER_FILE}..."):
+        df_master = load_master_data()
+else:
+    st.warning(f"⚠️ 未检测到主数据文件: `{LOCAL_MASTER_FILE}`。请将文件上传到项目根目录。")
 
 # --- Sidebar ---
 with st.sidebar:
@@ -134,7 +143,7 @@ with st.sidebar:
         st.success(f"✅ 已加载 {len(df_master)} 条记录")
         st.caption(f"来源: {LOCAL_MASTER_FILE}")
     else:
-        st.error("❌ 主数据加载失败")
+        st.info("等待数据加载...")
 
 # --- Step 1: 上传 ---
 st.markdown('<div class="step-card"><h3>📂 1. 上传待清洗文件</h3></div>', unsafe_allow_html=True)
@@ -149,7 +158,8 @@ if uploaded_file and not df_master.empty:
         
         file_rows = len(df_user)
         st.markdown(f'<div class="count-box">📊 读取成功: 共 {file_rows} 行数据</div>', unsafe_allow_html=True)
-        st.dataframe(df_user.head(3), hide_index=True, use_container_width=True)
+        # 修复警告：移除 use_container_width，改用默认行为或 width 参数
+        st.dataframe(df_user.head(3), hide_index=True)
         
         # --- Step 2: 映射 ---
         st.markdown('<div class="step-card"><h3>🤖 2. 智能字段映射</h3></div>', unsafe_allow_html=True)
@@ -172,7 +182,7 @@ if uploaded_file and not df_master.empty:
             target_addr_col = st.selectbox("🏠 地址列 (可选，提高精度)", [None] + all_cols, index=default_idx if default_idx else 0)
 
         # --- Step 3: 匹配 ---
-        st.markdown('<div class="step-card"><h3>🚀 3. 执行匹配 (已开启 Token 节省模式)</h3></div>', unsafe_allow_html=True)
+        st.markdown('<div class="step-card"><h3>🚀 3. 执行匹配</h3></div>', unsafe_allow_html=True)
         
         run_btn = st.button(f"开始匹配 ({file_rows} 行)", type="primary", use_container_width=True)
         
@@ -188,8 +198,7 @@ if uploaded_file and not df_master.empty:
             # 2. 安全转换为字典，避免 ValueError
             master_exact_lookup = df_master_unique.set_index('标准名称').to_dict('index')
             
-            # 准备模糊搜索的 choices (只用于未命中的情况)
-            # 注意：模糊匹配时是否去重取决于你的业务需求，通常保留全部候选项更好
+            # 准备模糊搜索的 choices
             master_choices = df_master['标准名称'].fillna('').astype(str).to_dict()
             
             exact_count = 0
@@ -200,22 +209,21 @@ if uploaded_file and not df_master.empty:
                 
                 # --- 核心逻辑: 先试全字匹配 ---
                 if raw_name in master_exact_lookup:
-                    # 🎯 命中! 节省一次 API 调用
+                    # 🎯 命中!
                     match_data = master_exact_lookup[raw_name]
                     res_row = {
                         "原始输入": raw_name,
                         "匹配ESID": match_data.get('esid'),
-                        "匹配标准名": raw_name, # 就是它自己
+                        "匹配标准名": raw_name,
                         "置信度": "High",
                         "理由": "完全匹配 (Exact Match)",
                         "匹配方式": "全字匹配"
                     }
                     exact_count += 1
-                    time.sleep(0.01) # 极快处理
+                    time.sleep(0.005) 
                     
                 else:
                     # 🤖 未命中 -> 进入模型匹配
-                    # 1. 粗筛
                     candidate_indices = get_candidates(raw_name, master_choices, limit=5)
                     
                     if not candidate_indices:
@@ -224,7 +232,6 @@ if uploaded_file and not df_master.empty:
                             "置信度": "Low", "理由": "无相似候选", "匹配方式": "无结果"
                         }
                     else:
-                        # 2. 精判 (调用 API)
                         candidates_df = df_master.loc[candidate_indices].copy()
                         ai_res = ai_match_row(client, row, target_name_col, target_addr_col, candidates_df)
                         
@@ -242,15 +249,14 @@ if uploaded_file and not df_master.empty:
                 
                 # 更新进度
                 progress_bar.progress((idx + 1) / file_rows)
-                status_text.text(f"[{idx+1}/{file_rows}] 正在处理: {raw_name} ({res_row['匹配方式']})")
+                status_text.text(f"[{idx+1}/{file_rows}] 处理中... {raw_name}")
             
-            status_text.success(f"✅ 完成! 全字匹配: {exact_count} 条 (省钱!), 模型匹配: {model_count} 条")
+            status_text.success(f"✅ 完成! 全字匹配: {exact_count} | 模型匹配: {model_count}")
             
             df_result = pd.DataFrame(results)
             df_final = pd.concat([df_user.reset_index(drop=True), df_result.drop(columns=["原始输入"])], axis=1)
             
             def highlight_row(row):
-                # 绿色显示全字匹配，黄色显示高置信度模型匹配
                 if row['匹配方式'] == '全字匹配':
                     return ['background-color: #d1fae5'] * len(row)
                 elif row['置信度'] == 'High':
@@ -258,14 +264,15 @@ if uploaded_file and not df_master.empty:
                 else:
                     return [''] * len(row)
 
-            st.dataframe(df_result.style.apply(highlight_row, axis=1), use_container_width=True)
+            # 修复警告: 移除 use_container_width
+            st.dataframe(df_result.style.apply(highlight_row, axis=1))
             csv = df_final.to_csv(index=False).encode('utf-8-sig')
-            st.download_button("📥 下载结果 (含匹配方式列)", csv, "matched_result_optimized.csv", "text/csv")
+            st.download_button("📥 下载结果", csv, "matched_result_pro.csv", "text/csv")
 
     except Exception as e:
         st.error(f"运行时错误: {str(e)}")
         st.exception(e)
 
 else:
-    if df_master.empty:
-        st.warning(f"请检查根目录下是否存在 {LOCAL_MASTER_FILE}")
+    if df_master.empty and os.path.exists(LOCAL_MASTER_FILE):
+         st.info("正在初始化数据引擎，请稍候...")
