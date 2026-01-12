@@ -65,7 +65,7 @@ def safe_generate(client, prompt, response_schema=None, retries=3):
                 response_schema=response_schema
             )
             response = client.models.generate_content(
-                model="gemini-3-pro-preview", 
+                model="gemini-2-flash", 
                 contents=prompt,
                 config=config
             )
@@ -533,4 +533,5 @@ if st.session_state.final_result_df is not None:
     
     csv = df_show.to_csv(index=False).encode('utf-8-sig')
     st.download_button("📥 下载完整结果", csv, "linkmed_batch_result.csv", "text/csv", type="primary")
+
 
