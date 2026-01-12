@@ -40,7 +40,13 @@ def safe_generate(client, prompt, response_schema=None):
             contents=prompt,
             config=config
         )
-        return json.loads(response.text)
+        # 解析返回结果
+        try:
+            parsed = json.loads(response.text)
+            return parsed
+        except json.JSONDecodeError:
+            return {"error": "JSON解析失败", "raw": response.text}
+            
     except Exception as e:
         return {"error": str(e)}
 
@@ -84,6 +90,9 @@ def smart_map_columns(client, df_user, master_cols):
     返回 JSON: {{ "name_col": "...", "addr_col": "..." }}
     """
     res = safe_generate(client, prompt)
+    # 防御性处理：如果这里也返回了list，取第一个
+    if isinstance(res, list):
+        res = res[0] if res else {}
     return res
 
 def get_candidates(query, choices, limit=5):
@@ -111,7 +120,7 @@ def ai_match_row(client, user_row, name_col, addr_col, candidates_df):
 
 # ================= 3. 页面 UI =================
 
-# 1. 先渲染 Header，确保 App 启动时有响应，防止 Health Check 失败
+# 1. 先渲染 Header，确保 App 启动时有响应
 st.markdown("""
     <style>
     .stApp {background-color: #F8F9FA;}
@@ -128,8 +137,8 @@ st.markdown("""
 
 client = get_client()
 
-# 2. 延迟加载主数据 (防止启动超时)
-df_master = pd.DataFrame() # 初始化为空
+# 2. 延迟加载主数据
+df_master = pd.DataFrame()
 if os.path.exists(LOCAL_MASTER_FILE):
     with st.spinner(f"正在加载主数据资源: {LOCAL_MASTER_FILE}..."):
         df_master = load_master_data()
@@ -158,7 +167,6 @@ if uploaded_file and not df_master.empty:
         
         file_rows = len(df_user)
         st.markdown(f'<div class="count-box">📊 读取成功: 共 {file_rows} 行数据</div>', unsafe_allow_html=True)
-        # 修复警告：移除 use_container_width，改用默认行为或 width 参数
         st.dataframe(df_user.head(3), hide_index=True)
         
         # --- Step 2: 映射 ---
@@ -191,14 +199,9 @@ if uploaded_file and not df_master.empty:
             progress_bar = st.progress(0)
             status_text = st.empty()
             
-            # ✅ 优化策略: 构建全字匹配字典 (已加入去重逻辑)
-            # 1. 显式去除重复的'标准名称'，保留第一次出现的行
+            # ✅ 优化策略: 构建全字匹配字典
             df_master_unique = df_master.drop_duplicates(subset=['标准名称'], keep='first')
-            
-            # 2. 安全转换为字典，避免 ValueError
             master_exact_lookup = df_master_unique.set_index('标准名称').to_dict('index')
-            
-            # 准备模糊搜索的 choices
             master_choices = df_master['标准名称'].fillna('').astype(str).to_dict()
             
             exact_count = 0
@@ -207,9 +210,8 @@ if uploaded_file and not df_master.empty:
             for idx, row in df_user.iterrows():
                 raw_name = str(row[target_name_col]).strip()
                 
-                # --- 核心逻辑: 先试全字匹配 ---
+                # --- 1. 全字匹配 ---
                 if raw_name in master_exact_lookup:
-                    # 🎯 命中!
                     match_data = master_exact_lookup[raw_name]
                     res_row = {
                         "原始输入": raw_name,
@@ -223,7 +225,7 @@ if uploaded_file and not df_master.empty:
                     time.sleep(0.005) 
                     
                 else:
-                    # 🤖 未命中 -> 进入模型匹配
+                    # --- 2. 模型匹配 ---
                     candidate_indices = get_candidates(raw_name, master_choices, limit=5)
                     
                     if not candidate_indices:
@@ -235,6 +237,14 @@ if uploaded_file and not df_master.empty:
                         candidates_df = df_master.loc[candidate_indices].copy()
                         ai_res = ai_match_row(client, row, target_name_col, target_addr_col, candidates_df)
                         
+                        # 🔥🔥🔥 修复点：处理 AI 返回的是列表的情况 🔥🔥🔥
+                        if isinstance(ai_res, list):
+                            if len(ai_res) > 0:
+                                ai_res = ai_res[0]
+                            else:
+                                ai_res = {} # 空列表处理
+                        
+                        # 确保 ai_res 是字典后再调用 .get
                         res_row = {
                             "原始输入": raw_name,
                             "匹配ESID": ai_res.get("match_esid"),
@@ -264,7 +274,6 @@ if uploaded_file and not df_master.empty:
                 else:
                     return [''] * len(row)
 
-            # 修复警告: 移除 use_container_width
             st.dataframe(df_result.style.apply(highlight_row, axis=1))
             csv = df_final.to_csv(index=False).encode('utf-8-sig')
             st.download_button("📥 下载结果", csv, "matched_result_pro.csv", "text/csv")
