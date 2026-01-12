@@ -9,15 +9,15 @@ from rapidfuzz import process, fuzz
 
 # ================= 1. 配置与初始化 =================
 
-st.set_page_config(page_title="LinkMed Matcher", layout="wide", page_icon="🔗")
+st.set_page_config(page_title="LinkMed Matcher Pro", layout="wide", page_icon="⚡")
 
 try:
     FIXED_API_KEY = st.secrets["GENAI_API_KEY"]
 except:
     FIXED_API_KEY = "" 
 
-# 本地主数据文件名
-LOCAL_MASTER_FILE = "MDM_retail.csv"
+# ✅ 修改 1: 指向 Excel 文件
+LOCAL_MASTER_FILE = "MDM_retail.xlsx"
 
 # ================= 2. 核心工具函数 =================
 
@@ -43,17 +43,27 @@ def safe_generate(client, prompt, response_schema=None):
 
 @st.cache_data
 def load_master_data():
+    """加载主数据，支持 xlsx 和 csv"""
     if os.path.exists(LOCAL_MASTER_FILE):
         try:
-            df = pd.read_csv(LOCAL_MASTER_FILE)
+            # ✅ 修改 2: 根据后缀自动选择读取引擎
+            if LOCAL_MASTER_FILE.endswith('.xlsx'):
+                df = pd.read_excel(LOCAL_MASTER_FILE)
+            else:
+                df = pd.read_csv(LOCAL_MASTER_FILE)
+                
+            # 清洗：去重 esid，并确保标准名称是字符串且去除首尾空格
             if 'esid' in df.columns:
                 df = df.drop_duplicates(subset=['esid'])
+            if '标准名称' in df.columns:
+                df['标准名称'] = df['标准名称'].astype(str).str.strip()
+                
             return df
         except Exception as e:
             st.error(f"读取主数据文件出错: {e}")
             return pd.DataFrame()
     else:
-        st.error(f"⚠️ 在根目录下未找到文件: {LOCAL_MASTER_FILE}")
+        st.error(f"⚠️ 未找到文件: {LOCAL_MASTER_FILE}。请确保该文件已上传到 GitHub 仓库的根目录。")
         return pd.DataFrame()
 
 def smart_map_columns(client, df_user, master_cols):
@@ -104,14 +114,17 @@ st.markdown("""
         border-radius: 5px; font-weight: bold; border-left: 5px solid #1976d2;
         margin: 10px 0; display: inline-block;
     }
+    .metric-badge {
+        background-color: #d1fae5; color: #065f46; padding: 4px 8px; border-radius: 4px; font-size: 0.8em; font-weight: bold;
+    }
     </style>
-    <div class="main-header">🔗 LinkMed 主数据匹配工具 (Local)</div>
+    <div class="main-header">⚡ LinkMed 极速匹配 (Token Saver)</div>
 """, unsafe_allow_html=True)
 
 client = get_client()
 
 # 加载主数据
-with st.spinner("正在加载本地主数据..."):
+with st.spinner(f"正在加载 {LOCAL_MASTER_FILE}..."):
     df_master = load_master_data()
 
 # --- Sidebar ---
@@ -134,16 +147,14 @@ if uploaded_file and not df_master.empty:
         else:
             df_user = pd.read_excel(uploaded_file)
         
-        # ✅ 新增：显式展示上传文件的行数
         file_rows = len(df_user)
-        st.markdown(f'<div class="count-box">📊 成功读取文件，共包含 {file_rows} 行数据</div>', unsafe_allow_html=True)
-        
+        st.markdown(f'<div class="count-box">📊 读取成功: 共 {file_rows} 行数据</div>', unsafe_allow_html=True)
         st.dataframe(df_user.head(3), hide_index=True, use_container_width=True)
         
         # --- Step 2: 映射 ---
         st.markdown('<div class="step-card"><h3>🤖 2. 智能字段映射</h3></div>', unsafe_allow_html=True)
-        
         col1, col2 = st.columns(2)
+        
         if 'map_config' not in st.session_state:
             with st.spinner("AI 正在分析表头..."):
                 st.session_state.map_config = smart_map_columns(client, df_user, df_master.columns.tolist())
@@ -161,61 +172,96 @@ if uploaded_file and not df_master.empty:
             target_addr_col = st.selectbox("🏠 地址列 (可选，提高精度)", [None] + all_cols, index=default_idx if default_idx else 0)
 
         # --- Step 3: 匹配 ---
-        st.markdown('<div class="step-card"><h3>🚀 3. 执行匹配</h3></div>', unsafe_allow_html=True)
+        st.markdown('<div class="step-card"><h3>🚀 3. 执行匹配 (已开启 Token 节省模式)</h3></div>', unsafe_allow_html=True)
         
-        run_btn = st.button(f"开始 AI 匹配 ({file_rows} 行)", type="primary", use_container_width=True)
+        run_btn = st.button(f"开始匹配 ({file_rows} 行)", type="primary", use_container_width=True)
         
         if run_btn:
             results = []
             progress_bar = st.progress(0)
             status_text = st.empty()
             
+            # ✅ 优化策略 1: 构建全字匹配字典 (O(1) 查找)
+            # 这里的 value 存储我们需要的整行数据，方便直接提取
+            master_exact_lookup = df_master.set_index('标准名称').to_dict('index')
+            
+            # 准备模糊搜索的 choices (只用于未命中的情况)
             master_choices = df_master['标准名称'].fillna('').astype(str).to_dict()
             
+            exact_count = 0
+            model_count = 0
+            
             for idx, row in df_user.iterrows():
-                raw_name = str(row[target_name_col])
+                raw_name = str(row[target_name_col]).strip()
                 
-                # 1. 粗筛
-                candidate_indices = get_candidates(raw_name, master_choices, limit=5)
-                
-                if not candidate_indices:
-                    res_row = {"原始输入": raw_name, "匹配ESID": None, "匹配标准名": None, "置信度": "Low", "理由": "无相似候选"}
-                else:
-                    # 2. 精判
-                    candidates_df = df_master.loc[candidate_indices].copy()
-                    ai_res = ai_match_row(client, row, target_name_col, target_addr_col, candidates_df)
-                    
+                # --- 核心逻辑: 先试全字匹配 ---
+                if raw_name in master_exact_lookup:
+                    # 🎯 命中! 节省一次 API 调用
+                    match_data = master_exact_lookup[raw_name]
                     res_row = {
                         "原始输入": raw_name,
-                        "匹配ESID": ai_res.get("match_esid"),
-                        "匹配标准名": ai_res.get("match_name"),
-                        "置信度": ai_res.get("confidence", "Low"),
-                        "理由": ai_res.get("reason")
+                        "匹配ESID": match_data.get('esid'),
+                        "匹配标准名": raw_name, # 就是它自己
+                        "置信度": "High",
+                        "理由": "完全匹配 (Exact Match)",
+                        "匹配方式": "全字匹配"
                     }
+                    exact_count += 1
+                    time.sleep(0.01) # 极快处理
+                    
+                else:
+                    # 🤖 未命中 -> 进入模型匹配
+                    # 1. 粗筛
+                    candidate_indices = get_candidates(raw_name, master_choices, limit=5)
+                    
+                    if not candidate_indices:
+                        res_row = {
+                            "原始输入": raw_name, "匹配ESID": None, "匹配标准名": None, 
+                            "置信度": "Low", "理由": "无相似候选", "匹配方式": "无结果"
+                        }
+                    else:
+                        # 2. 精判 (调用 API)
+                        candidates_df = df_master.loc[candidate_indices].copy()
+                        ai_res = ai_match_row(client, row, target_name_col, target_addr_col, candidates_df)
+                        
+                        res_row = {
+                            "原始输入": raw_name,
+                            "匹配ESID": ai_res.get("match_esid"),
+                            "匹配标准名": ai_res.get("match_name"),
+                            "置信度": ai_res.get("confidence", "Low"),
+                            "理由": ai_res.get("reason"),
+                            "匹配方式": "模型匹配"
+                        }
+                    model_count += 1
                 
                 results.append(res_row)
                 
-                # ✅ 更新：在进度信息中显示 (当前行/总行数)
+                # 更新进度
                 progress_bar.progress((idx + 1) / file_rows)
-                status_text.text(f"正在处理 ({idx + 1}/{file_rows}): {raw_name} ...")
+                status_text.text(f"[{idx+1}/{file_rows}] 正在处理: {raw_name} ({res_row['匹配方式']})")
             
-            status_text.success(f"✅ 匹配完成！共处理 {file_rows} 条数据。")
+            status_text.success(f"✅ 完成! 全字匹配: {exact_count} 条 (省钱!), 模型匹配: {model_count} 条")
             
             df_result = pd.DataFrame(results)
             df_final = pd.concat([df_user.reset_index(drop=True), df_result.drop(columns=["原始输入"])], axis=1)
             
-            def highlight_conf(val):
-                color = '#d4edda' if val == 'High' else '#fff3cd' if val == 'Medium' else '#f8d7da'
-                return f'background-color: {color}'
+            def highlight_row(row):
+                # 绿色显示全字匹配，黄色显示高置信度模型匹配
+                if row['匹配方式'] == '全字匹配':
+                    return ['background-color: #d1fae5'] * len(row)
+                elif row['置信度'] == 'High':
+                    return ['background-color: #fff3cd'] * len(row)
+                else:
+                    return [''] * len(row)
 
-            st.dataframe(df_result.style.applymap(highlight_conf, subset=['置信度']), use_container_width=True)
+            st.dataframe(df_result.style.apply(highlight_row, axis=1), use_container_width=True)
             csv = df_final.to_csv(index=False).encode('utf-8-sig')
-            st.download_button("📥 下载完整结果", csv, "matched_result.csv", "text/csv")
+            st.download_button("📥 下载结果 (含匹配方式列)", csv, "matched_result_optimized.csv", "text/csv")
 
     except Exception as e:
-        st.error(f"运行时发生错误: {str(e)}")
+        st.error(f"运行时错误: {str(e)}")
         st.exception(e)
 
 else:
     if df_master.empty:
-        st.warning("请确认 '表头.xlsx - Sheet1.csv' 已上传至根目录。")
+        st.warning(f"请检查根目录下是否存在 {LOCAL_MASTER_FILE}")
