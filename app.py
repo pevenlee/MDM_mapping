@@ -20,7 +20,21 @@ except:
 # ✅ 指向 Excel 文件
 LOCAL_MASTER_FILE = "MDM_retail.xlsx"
 
+# 初始化 Session State 中的 uploader key，用于强制重置文件上传控件
+if 'uploader_key' not in st.session_state:
+    st.session_state.uploader_key = str(time.time())
+
 # ================= 2. 核心工具函数 =================
+
+def reset_app():
+    """重置 App 状态，允许重新上传"""
+    # 清除所有 session_state
+    for key in list(st.session_state.keys()):
+        del st.session_state[key]
+    # 重置 uploader key
+    st.session_state.uploader_key = str(time.time())
+    # 强制刷新页面
+    st.rerun()
 
 @st.cache_resource
 def get_client():
@@ -40,59 +54,48 @@ def safe_generate(client, prompt, response_schema=None):
             contents=prompt,
             config=config
         )
-        # 解析返回结果
         try:
             parsed = json.loads(response.text)
             return parsed
         except json.JSONDecodeError:
             return {"error": "JSON解析失败", "raw": response.text}
-            
     except Exception as e:
         return {"error": str(e)}
 
 @st.cache_resource(show_spinner=False)
 def load_master_data():
-    """加载主数据，支持 xlsx 和 csv，带内存优化"""
     if os.path.exists(LOCAL_MASTER_FILE):
         try:
-            # 强制调用垃圾回收，释放旧内存
             gc.collect()
-            
-            # ✅ 根据后缀自动选择读取引擎
             if LOCAL_MASTER_FILE.endswith('.xlsx'):
-                # engine='openpyxl' 更稳定
                 df = pd.read_excel(LOCAL_MASTER_FILE, engine='openpyxl')
             else:
                 df = pd.read_csv(LOCAL_MASTER_FILE)
-                
-            # 清洗：去重 esid，并确保标准名称是字符串且去除首尾空格
+            
             if 'esid' in df.columns:
                 df = df.drop_duplicates(subset=['esid'])
             if '标准名称' in df.columns:
                 df['标准名称'] = df['标准名称'].astype(str).str.strip()
-                
             return df
         except Exception as e:
             st.error(f"读取主数据文件出错: {e}")
             return pd.DataFrame()
     else:
-        # 文件不存在时不报错，只返回空，在UI层提示
         return pd.DataFrame()
 
-def smart_map_columns(client, df_user, master_cols):
+def smart_map_columns(client, df_user):
+    user_cols = df_user.columns.tolist()
     sample_data = df_user.head(3).to_markdown(index=False)
     prompt = f"""
-    你是一个数据映射专家。
-    【主数据核心列】: {master_cols}
-    【用户上传数据预览】:
-    {sample_data}
-    请分析用户的列名，找出代表“药房名称”的列和“地址”列。
-    返回 JSON: {{ "name_col": "...", "addr_col": "..." }}
+    你是一个数据清洗专家。请分析用户上传数据的表头和前几行数据。
+    【用户列名列表】: {user_cols}
+    【用户数据预览】: {sample_data}
+    【任务】：找出"药房名称"列(name_col)和"地址"列(addr_col)。
+    【要求】：返回列名必须存在于列表中。
+    【输出 JSON】: {{ "name_col": "...", "addr_col": "..." }}
     """
     res = safe_generate(client, prompt)
-    # 防御性处理：如果这里也返回了list，取第一个
-    if isinstance(res, list):
-        res = res[0] if res else {}
+    if isinstance(res, list): res = res[0] if res else {}
     return res
 
 def get_candidates(query, choices, limit=5):
@@ -104,7 +107,6 @@ def get_candidates(query, choices, limit=5):
 def ai_match_row(client, user_row, name_col, addr_col, candidates_df):
     user_name = str(user_row.get(name_col, ''))
     user_addr = str(user_row.get(addr_col, '')) if addr_col else "未知"
-    
     cols_to_keep = ['esid', '标准名称', '别名', '省', '市', '区', '地址']
     valid_cols = [c for c in cols_to_keep if c in candidates_df.columns]
     candidates_json = candidates_df[valid_cols].to_json(orient="records", force_ascii=False)
@@ -120,7 +122,6 @@ def ai_match_row(client, user_row, name_col, addr_col, candidates_df):
 
 # ================= 3. 页面 UI =================
 
-# 1. 先渲染 Header，确保 App 启动时有响应
 st.markdown("""
     <style>
     .stApp {background-color: #F8F9FA;}
@@ -137,26 +138,38 @@ st.markdown("""
 
 client = get_client()
 
-# 2. 延迟加载主数据
+# 延迟加载主数据
 df_master = pd.DataFrame()
 if os.path.exists(LOCAL_MASTER_FILE):
     with st.spinner(f"正在加载主数据资源: {LOCAL_MASTER_FILE}..."):
         df_master = load_master_data()
 else:
-    st.warning(f"⚠️ 未检测到主数据文件: `{LOCAL_MASTER_FILE}`。请将文件上传到项目根目录。")
+    st.warning(f"⚠️ 未检测到主数据文件: `{LOCAL_MASTER_FILE}`")
 
 # --- Sidebar ---
 with st.sidebar:
-    st.header("🗄️ 主数据看板")
+    st.header("🗄️ 控制台")
+    
+    # 🔥 全局重置按钮 🔥
+    if st.button("🗑️ 清空任务 / 重新上传", type="secondary", use_container_width=True):
+        reset_app()
+        
+    st.divider()
+    st.subheader("主数据状态")
     if not df_master.empty:
         st.success(f"✅ 已加载 {len(df_master)} 条记录")
-        st.caption(f"来源: {LOCAL_MASTER_FILE}")
     else:
-        st.info("等待数据加载...")
+        st.info("等待加载...")
 
 # --- Step 1: 上传 ---
 st.markdown('<div class="step-card"><h3>📂 1. 上传待清洗文件</h3></div>', unsafe_allow_html=True)
-uploaded_file = st.file_uploader("支持 Excel/CSV", type=['xlsx', 'csv'])
+
+# 使用动态 key，reset_app() 改变 key 后会强制重置这个组件
+uploaded_file = st.file_uploader(
+    "支持 Excel/CSV", 
+    type=['xlsx', 'csv'], 
+    key=st.session_state.get('uploader_key', 'default_key')
+)
 
 if uploaded_file and not df_master.empty:
     try:
@@ -169,25 +182,27 @@ if uploaded_file and not df_master.empty:
         st.markdown(f'<div class="count-box">📊 读取成功: 共 {file_rows} 行数据</div>', unsafe_allow_html=True)
         st.dataframe(df_user.head(3), hide_index=True)
         
-        # --- Step 2: 映射 ---
-        st.markdown('<div class="step-card"><h3>🤖 2. 智能字段映射</h3></div>', unsafe_allow_html=True)
-        col1, col2 = st.columns(2)
+        # --- Step 2: 自动映射 ---
+        st.markdown('<div class="step-card"><h3>🤖 2. 智能字段识别</h3></div>', unsafe_allow_html=True)
         
-        if 'map_config' not in st.session_state:
-            with st.spinner("AI 正在分析表头..."):
-                st.session_state.map_config = smart_map_columns(client, df_user, df_master.columns.tolist())
+        if 'map_config' not in st.session_state or st.session_state.get('last_file') != uploaded_file.name:
+            with st.spinner("AI 正在自动识别表头..."):
+                st.session_state.map_config = smart_map_columns(client, df_user)
+                st.session_state.last_file = uploaded_file.name
         
         map_res = st.session_state.map_config
         all_cols = df_user.columns.tolist()
+        col1, col2 = st.columns(2)
         
         with col1:
-            default_name = map_res.get('name_col') if map_res.get('name_col') in all_cols else all_cols[0]
-            target_name_col = st.selectbox("📍 药房名称列", all_cols, index=all_cols.index(default_name))
+            s_name = map_res.get('name_col')
+            idx_name = all_cols.index(s_name) if s_name in all_cols else 0
+            target_name_col = st.selectbox(f"📍 药房名称列 (AI建议: {s_name})", all_cols, index=idx_name)
             
         with col2:
-            default_addr = map_res.get('addr_col')
-            default_idx = all_cols.index(default_addr) if default_addr in all_cols else None
-            target_addr_col = st.selectbox("🏠 地址列 (可选，提高精度)", [None] + all_cols, index=default_idx if default_idx else 0)
+            s_addr = map_res.get('addr_col')
+            idx_addr = all_cols.index(s_addr) if s_addr in all_cols else 0
+            target_addr_col = st.selectbox(f"🏠 地址列 (AI建议: {s_addr})", [None] + all_cols, index=idx_addr + 1 if s_addr in all_cols else 0)
 
         # --- Step 3: 匹配 ---
         st.markdown('<div class="step-card"><h3>🚀 3. 执行匹配</h3></div>', unsafe_allow_html=True)
@@ -199,7 +214,7 @@ if uploaded_file and not df_master.empty:
             progress_bar = st.progress(0)
             status_text = st.empty()
             
-            # ✅ 优化策略: 构建全字匹配字典
+            # 准备匹配数据
             df_master_unique = df_master.drop_duplicates(subset=['标准名称'], keep='first')
             master_exact_lookup = df_master_unique.set_index('标准名称').to_dict('index')
             master_choices = df_master['标准名称'].fillna('').astype(str).to_dict()
@@ -210,24 +225,18 @@ if uploaded_file and not df_master.empty:
             for idx, row in df_user.iterrows():
                 raw_name = str(row[target_name_col]).strip()
                 
-                # --- 1. 全字匹配 ---
+                # --- 核心匹配逻辑 ---
                 if raw_name in master_exact_lookup:
                     match_data = master_exact_lookup[raw_name]
                     res_row = {
-                        "原始输入": raw_name,
-                        "匹配ESID": match_data.get('esid'),
-                        "匹配标准名": raw_name,
-                        "置信度": "High",
-                        "理由": "完全匹配 (Exact Match)",
-                        "匹配方式": "全字匹配"
+                        "原始输入": raw_name, "匹配ESID": match_data.get('esid'),
+                        "匹配标准名": raw_name, "置信度": "High",
+                        "理由": "完全匹配", "匹配方式": "全字匹配"
                     }
                     exact_count += 1
                     time.sleep(0.005) 
-                    
                 else:
-                    # --- 2. 模型匹配 ---
                     candidate_indices = get_candidates(raw_name, master_choices, limit=5)
-                    
                     if not candidate_indices:
                         res_row = {
                             "原始输入": raw_name, "匹配ESID": None, "匹配标准名": None, 
@@ -236,15 +245,8 @@ if uploaded_file and not df_master.empty:
                     else:
                         candidates_df = df_master.loc[candidate_indices].copy()
                         ai_res = ai_match_row(client, row, target_name_col, target_addr_col, candidates_df)
+                        if isinstance(ai_res, list): ai_res = ai_res[0] if ai_res else {}
                         
-                        # 🔥🔥🔥 修复点：处理 AI 返回的是列表的情况 🔥🔥🔥
-                        if isinstance(ai_res, list):
-                            if len(ai_res) > 0:
-                                ai_res = ai_res[0]
-                            else:
-                                ai_res = {} # 空列表处理
-                        
-                        # 确保 ai_res 是字典后再调用 .get
                         res_row = {
                             "原始输入": raw_name,
                             "匹配ESID": ai_res.get("match_esid"),
@@ -256,8 +258,6 @@ if uploaded_file and not df_master.empty:
                     model_count += 1
                 
                 results.append(res_row)
-                
-                # 更新进度
                 progress_bar.progress((idx + 1) / file_rows)
                 status_text.text(f"[{idx+1}/{file_rows}] 处理中... {raw_name}")
             
@@ -267,21 +267,24 @@ if uploaded_file and not df_master.empty:
             df_final = pd.concat([df_user.reset_index(drop=True), df_result.drop(columns=["原始输入"])], axis=1)
             
             def highlight_row(row):
-                if row['匹配方式'] == '全字匹配':
-                    return ['background-color: #d1fae5'] * len(row)
-                elif row['置信度'] == 'High':
-                    return ['background-color: #fff3cd'] * len(row)
-                else:
-                    return [''] * len(row)
+                if row['匹配方式'] == '全字匹配': return ['background-color: #d1fae5'] * len(row)
+                elif row['置信度'] == 'High': return ['background-color: #fff3cd'] * len(row)
+                else: return [''] * len(row)
 
             st.dataframe(df_result.style.apply(highlight_row, axis=1))
             csv = df_final.to_csv(index=False).encode('utf-8-sig')
             st.download_button("📥 下载结果", csv, "matched_result_pro.csv", "text/csv")
 
     except Exception as e:
-        st.error(f"运行时错误: {str(e)}")
+        # 🔥🔥🔥 异常处理增强：提供重置按钮 🔥🔥🔥
+        st.error(f"❌ 运行时发生异常: {str(e)}")
         st.exception(e)
+        
+        st.markdown("---")
+        st.warning("检测到程序中断。您可以点击下方按钮重置环境并重新上传文件。")
+        if st.button("🔄 重置并重新上传", type="primary"):
+            reset_app()
 
 else:
     if df_master.empty and os.path.exists(LOCAL_MASTER_FILE):
-         st.info("正在初始化数据引擎，请稍候...")
+         st.info("正在初始化数据引擎...")
