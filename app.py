@@ -76,7 +76,7 @@ def load_master_data():
             else:
                 df = pd.read_csv(LOCAL_MASTER_FILE)
             
-            # 1. 索引重置 (防止索引混乱导致崩溃)
+            # 1. 索引重置
             df = df.reset_index(drop=True)
             
             # 2. 补全缺失列
@@ -141,7 +141,7 @@ def get_candidates_hybrid_safe(search_name, chain_name, df_master, geo_index, ch
         geo_indices = set()
         scope_level = "Global"
 
-        # 安全的字典查找 (用 .get 避免 KeyError)
+        # 安全的字典查找
         if u_dist and u_dist in geo_index['district']:
             geo_indices = set(geo_index['district'][u_dist])
             scope_level = f"District ({u_dist})"
@@ -167,7 +167,7 @@ def get_candidates_hybrid_safe(search_name, chain_name, df_master, geo_index, ch
 
         # 3. 策略 B: 模糊搜索
         if geo_indices:
-            # 限制搜索范围，防止内存溢出
+            # 限制搜索范围
             search_pool_indices = list(geo_indices)
             
             # 使用 loc 安全提取
@@ -380,45 +380,51 @@ if st.session_state.final_result_df is None:
             st.session_state.match_stats = stats
             st.rerun()
 
-# --- 4. 结果展示 ---
+# --- 4. 结果展示 (修复了 f-string 错误) ---
 if st.session_state.final_result_df is not None:
     s = st.session_state.match_stats
     total = s.get('total', 0)
-    # 如果统计数为0，尝试用df长度
     if total == 0: total = len(st.session_state.final_result_df)
     if total == 0: total = 1
     
     st.markdown("### 📊 匹配统计报告")
     
     col1, col2, col3, col4 = st.columns(4)
+    
+    # 提前计算比率，避免 f-string 语法错误
+    exact_pct = s.get('exact', 0) / total
+    model_done = s.get('high', 0) + s.get('low', 0)
+    model_pct = model_done / total
+    high_pct = s.get('high', 0) / model_done if model_done > 0 else 0.0
+    low_pct = s.get('low', 0) / model_done if model_done > 0 else 0.0
+
     with col1:
         st.markdown(f"""
         <div class="stat-card">
             <div class="sub-text">🎯 全字匹配</div>
             <div class="big-num">{s.get('exact', 0)} 行</div>
-            <div style="color:green; font-weight:bold;">{s.get('exact', 0)/total:.1%}</div>
+            <div style="color:green; font-weight:bold;">{exact_pct:.1%}</div>
         </div>""", unsafe_allow_html=True)
     with col2:
-        model_done = s.get('high', 0) + s.get('low', 0)
         st.markdown(f"""
         <div class="stat-card">
             <div class="sub-text">🤖 模型处理</div>
             <div class="big-num">{model_done} 行</div>
-            <div style="color:blue; font-weight:bold;">{model_done/total:.1%}</div>
+            <div style="color:blue; font-weight:bold;">{model_pct:.1%}</div>
         </div>""", unsafe_allow_html=True)
     with col3:
         st.markdown(f"""
         <div class="stat-card">
             <div class="sub-text">🔥 High 置信度</div>
             <div class="big-num">{s.get('high', 0)} 行</div>
-            <div class="sub-text">占模型: {s.get('high', 0)/model_done:.1% if model_done else 0}</div>
+            <div class="sub-text">占模型: {high_pct:.1%}</div>
         </div>""", unsafe_allow_html=True)
     with col4:
         st.markdown(f"""
         <div class="stat-card">
             <div class="sub-text">⚠️ Low 置信度</div>
             <div class="big-num">{s.get('low', 0)} 行</div>
-            <div class="sub-text">占模型: {s.get('low', 0)/model_done:.1% if model_done else 0}</div>
+            <div class="sub-text">占模型: {low_pct:.1%}</div>
         </div>""", unsafe_allow_html=True)
 
     st.divider()
