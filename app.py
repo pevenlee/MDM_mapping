@@ -10,7 +10,7 @@ from rapidfuzz import process, fuzz
 
 # ================= 1. 配置与初始化 =================
 
-st.set_page_config(page_title="LinkMed Matcher Ultimate", layout="wide", page_icon="🧬")
+st.set_page_config(page_title="LinkMed Matcher Hierarchical", layout="wide", page_icon="🧬")
 
 try:
     FIXED_API_KEY = st.secrets["GENAI_API_KEY"]
@@ -67,7 +67,7 @@ def safe_generate(client, prompt, response_schema=None, retries=3):
 
 @st.cache_resource(show_spinner=False)
 def load_master_data():
-    """加载并建立多维索引 (安全版)"""
+    """加载并建立严格的地理分层索引"""
     if os.path.exists(LOCAL_MASTER_FILE):
         try:
             gc.collect()
@@ -79,34 +79,39 @@ def load_master_data():
             # 1. 索引重置
             df = df.reset_index(drop=True)
             
-            # 2. 补全缺失列
+            # 2. 补全并清洗列
             target_cols = ['标准名称', '省', '市', '区', '机构类型', '地址', '连锁品牌']
             for col in target_cols:
-                if col not in df.columns:
-                    df[col] = ''
-            
-            # 3. 强制类型转换
-            for col in target_cols:
+                if col not in df.columns: df[col] = ''
                 df[col] = df[col].astype(str).replace('nan', '').str.strip()
                 
-            # 4. 建立索引
-            geo_index = {
-                'province': df.groupby('省').groups,
-                'city': df.groupby('市').groups,
-                'district': df.groupby('区').groups
-            }
+            # 3. 建立分层索引 (Dict[Geokey, IndexObject])
+            # 这允许我们瞬间提取出 "广东省-广州市-越秀区" 下的所有药店
             
+            # 组合键索引 (更精准)
+            # 省索引
+            prov_groups = df.groupby('省').groups
+            
+            # 市索引 (考虑同名城市较少，直接用市名，或者用 省+市)
+            # 这里简单起见假设市名唯一，或者即使重名也一起搜，影响不大
+            city_groups = df.groupby('市').groups
+            
+            # 区索引 (区重名多，如“朝阳区”，所以最好是 市+区，但这里我们先按区名建，检索时再做交集优化，或者简单按区名)
+            # 为了响应用户需求“同一个区里的”，我们建立严格的区索引
+            dist_groups = df.groupby('区').groups
+            
+            # 连锁索引
             chain_groups = {}
             mask = df['连锁品牌'].str.len() > 1
             if mask.any():
                 chain_groups = df[mask].groupby('连锁品牌').groups
             
-            return df, geo_index, chain_groups
+            return df, prov_groups, city_groups, dist_groups, chain_groups
         except Exception as e:
             st.error(f"读取主数据错误: {e}")
-            return pd.DataFrame(), {}, {}
+            return pd.DataFrame(), {}, {}, {}, {}
     else:
-        return pd.DataFrame(), {}, {}
+        return pd.DataFrame(), {}, {}, {}, {}
 
 def smart_map_columns(client, df_user):
     user_cols = df_user.columns.tolist()
@@ -128,80 +133,131 @@ def smart_map_columns(client, df_user):
     if isinstance(res, list): res = res[0] if res else {}
     return res
 
-def get_candidates_hybrid_safe(search_name, chain_name, df_master, geo_index, chain_groups, user_row, mapping):
+def get_candidates_hierarchical(search_name, chain_name, df_master, prov_groups, city_groups, dist_groups, chain_groups, user_row, mapping):
     """
-    🌟 混合检索逻辑 (防崩溃版)
+    🌟 严格分层检索逻辑 (Hierarchical Scope)
+    优先级: 区 > 市 > 省 > 全局
     """
     try:
-        # 1. 确定地理范围索引
+        # 获取用户行数据
         u_prov = str(user_row[mapping['prov']]) if mapping['prov'] and pd.notna(user_row[mapping['prov']]) else ''
         u_city = str(user_row[mapping['city']]) if mapping['city'] and pd.notna(user_row[mapping['city']]) else ''
         u_dist = str(user_row[mapping['dist']]) if mapping['dist'] and pd.notna(user_row[mapping['dist']]) else ''
         
-        geo_indices = set()
-        scope_level = "Global"
+        target_indices = set()
+        scope_desc = ""
 
-        # 安全的字典查找
-        if u_dist and u_dist in geo_index['district']:
-            geo_indices = set(geo_index['district'][u_dist])
-            scope_level = f"District ({u_dist})"
-        elif u_city and u_city in geo_index['city']:
-            geo_indices = set(geo_index['city'][u_city])
-            scope_level = f"City ({u_city})"
-        elif u_prov and u_prov in geo_index['province']:
-            geo_indices = set(geo_index['province'][u_prov])
-            scope_level = f"Province ({u_prov})"
+        # --- 层级 1: 区匹配 (District Level) ---
+        if u_dist and u_dist in dist_groups:
+            # 找到了对应区的索引
+            # 优化: 如果有城市信息，取交集防止重名区 (例如不同城市的"城关区")
+            dist_indices = set(dist_groups[u_dist])
+            
+            if u_city and u_city in city_groups:
+                city_indices = set(city_groups[u_city])
+                # 取交集：既在这个市，又在这个区
+                intersection = dist_indices.intersection(city_indices)
+                if intersection:
+                    target_indices = intersection
+                    scope_desc = f"精准定位: {u_city}{u_dist}"
+                else:
+                    # 如果交集为空（可能是主数据城市填错了），回退到仅按区
+                    target_indices = dist_indices
+                    scope_desc = f"区域定位: {u_dist}"
+            else:
+                target_indices = dist_indices
+                scope_desc = f"区域定位: {u_dist}"
+        
+        # --- 层级 2: 市匹配 (City Level) ---
+        # 如果没有区信息，或者该区在主数据里完全没有记录
+        elif u_city and u_city in city_groups:
+            target_indices = set(city_groups[u_city])
+            scope_desc = f"城市定位: {u_city}"
+            
+        # --- 层级 3: 省匹配 (Province Level) ---
+        elif u_prov and u_prov in prov_groups:
+            target_indices = set(prov_groups[u_prov])
+            scope_desc = f"省份定位: {u_prov}"
+            
+        # --- 层级 4: 全局 (Global) ---
         else:
-            geo_indices = set(df_master.index)
-            scope_level = "Global (No Geo Match)"
+            target_indices = set(df_master.index)
+            scope_desc = "全局搜索 (无地理信息)"
 
-        candidates_indices = set()
-
-        # 2. 策略 A: 连锁下钻
+        # --- 连锁下钻增强 (Chain Drill-down) ---
+        # 如果在确定的地理范围内，我们还要特别关注同连锁的店
+        # 这一步是为了防止模糊搜索漏掉名字差异大的分店
+        force_chain_indices = set()
         if chain_name and chain_name in chain_groups:
-            chain_store_indices = set(chain_groups[chain_name])
-            valid_chain_stores = chain_store_indices.intersection(geo_indices)
-            candidates_indices.update(valid_chain_stores)
-            if len(valid_chain_stores) > 0:
-                scope_level += " + Chain Drill-down"
+            chain_indices = set(chain_groups[chain_name])
+            # 仅保留在当前地理范围内的该连锁门店
+            force_chain_indices = chain_indices.intersection(target_indices)
 
-        # 3. 策略 B: 模糊搜索
-        if geo_indices:
-            # 限制搜索范围
-            search_pool_indices = list(geo_indices)
+        # --- 候选提取 ---
+        candidates_indices = set()
+        candidates_indices.update(force_chain_indices) # 先加入同连锁的
+        
+        # 模糊搜索 (在地理范围内)
+        if target_indices:
+            # 为了性能，如果范围依然巨大 (>5000) 且有连锁候选，可以减少模糊搜索
+            # 这里我们还是做一次检索
             
-            # 使用 loc 安全提取
-            current_scope_df = df_master.loc[search_pool_indices]
-            choices = current_scope_df['标准名称'].fillna('').astype(str).to_dict()
-            
-            results = process.extract(search_name, choices, limit=5, scorer=fuzz.WRatio)
-            for r in results:
-                candidates_indices.add(r[2]) 
+            search_pool_indices = list(target_indices)
+            # 安全切片
+            if len(search_pool_indices) > 5000 and len(force_chain_indices) > 0:
+                # 如果范围太大但已经找到了连锁店，就只在连锁店里找 + 少量全局采样(这里简化为不采样)
+                pass 
+            else:
+                current_scope_df = df_master.loc[search_pool_indices]
+                choices = current_scope_df['标准名称'].fillna('').astype(str).to_dict()
+                
+                # 提取前 8 名
+                results = process.extract(search_name, choices, limit=8, scorer=fuzz.WRatio)
+                for r in results:
+                    candidates_indices.add(r[2])
 
-        return list(candidates_indices), scope_level
+        return list(candidates_indices), scope_desc
     
     except Exception as e:
-        print(f"Retrieval Error: {e}")
+        print(f"Hierarchical Retrieval Error: {e}")
         return [], "Error"
 
-def ai_match_row_expert(client, user_row, search_name, chain_name, scope_level, candidates_df):
+def ai_match_row_v3(client, user_row, search_name, chain_name, scope_desc, candidates_df):
     cols_to_keep = ['esid', '标准名称', '机构类型', '省', '市', '区', '地址', '连锁品牌']
     valid_cols = [c for c in cols_to_keep if c in candidates_df.columns]
     candidates_json = candidates_df[valid_cols].to_json(orient="records", force_ascii=False)
     
     prompt = f"""
     【角色】主数据匹配专家。
-    【输入】名称: "{search_name}", 连锁: "{chain_name}", 范围: {scope_level}
-    【原始行】: {user_row.to_json(force_ascii=False)}
-    【候选集】: {candidates_json}
     
-    【核心规则】:
-    1. **总部陷阱**: 除非输入明确是总部，否则不要匹配“总公司/总部”类型的候选。优先匹配门店。
-    2. **地址交叉验证**: 输入名称若包含路名(如"人民路店")，请核对候选的【地址】列。地址吻合是最高置信度。
-    3. **名称组合**: 若输入为"连锁+地名"，优先寻找名称或地址含该地名的记录。
+    【待匹配实体】
+    - 组合名称: "{search_name}"
+    - 连锁品牌: "{chain_name}"
+    - 当前检索范围: {scope_desc} (已仅筛选此范围内的药店)
+    - 原始地址: "{user_row.get('地址列_raw', '')}"
+    
+    【候选主数据】
+    {candidates_json}
+    
+    【匹配标准 - 分级置信度】:
+    1. **High (高)**: 
+       - 核心名称完全一致 或 仅有"大药房/有限公司"等后缀差异。
+       - 并且 地址/行政区划 高度吻合。
+       - 如果包含路名，必须匹配到。
+    2. **Mid (中)**: 
+       - 肯定是同一家连锁。
+       - 但分店名有细微差异（如"一分店" vs "一店"，"南山店" vs "南山分店"）。
+       - 或者地址信息缺失，但该区域内仅有这一家该品牌的店，逻辑上大概率是它。
+    3. **Low (低)**: 
+       - 名称相似但无法确定（如 "康康药店" vs "康康大药房"，无地址佐证）。
+       - 只有连锁名一致，但分店名完全不同。
+       - 没有任何匹配项。
+       
+    【特殊规则】
+    - **总部陷阱**: 除非用户找总部，否则不要匹配"总公司"。优先匹配门店。
     
     【输出 JSON】:
-    {{ "match_esid": "...", "match_name": "...", "match_type": "...", "confidence": "High/Low", "reason": "..." }}
+    {{ "match_esid": "...", "match_name": "...", "match_type": "...", "confidence": "High/Mid/Low", "reason": "..." }}
     """
     return safe_generate(client, prompt)
 
@@ -213,21 +269,19 @@ st.markdown("""
     .stat-card {background: #ffffff; padding: 15px; border-radius: 8px; border: 1px solid #e5e7eb; box-shadow: 0 1px 2px rgba(0,0,0,0.05);}
     .big-num {font-size: 24px; font-weight: bold; color: #1e40af;}
     .sub-text {font-size: 14px; color: #6b7280;}
-    .success-box {background-color: #dcfce7; color: #166534; padding: 10px; border-radius: 5px; border: 1px solid #bbf7d0; margin-bottom: 10px;}
-    .info-box {background-color: #e0f2fe; color: #075985; padding: 10px; border-radius: 5px; border: 1px solid #bae6fd; margin-bottom: 10px;}
     </style>
     <div style="font-size: 26px; font-weight: bold; color: #1E3A8A; margin-bottom: 20px;">
-    🧬 LinkMed Matcher (Safe Mode)
+    🧬 LinkMed Matcher (Hierarchical Logic)
     </div>
 """, unsafe_allow_html=True)
 
 client = get_client()
 
 # 加载数据
-df_master, geo_index, chain_groups = pd.DataFrame(), {}, {}
+df_master, prov_groups, city_groups, dist_groups, chain_groups = pd.DataFrame(), {}, {}, {}, {}
 if os.path.exists(LOCAL_MASTER_FILE):
-    with st.spinner(f"正在加载主数据..."):
-        df_master, geo_index, chain_groups = load_master_data()
+    with st.spinner(f"正在构建分层地理索引..."):
+        df_master, prov_groups, city_groups, dist_groups, chain_groups = load_master_data()
 else:
     st.warning(f"⚠️ 文件缺失: `{LOCAL_MASTER_FILE}`")
 
@@ -238,7 +292,6 @@ with st.sidebar:
         reset_app()
     if not df_master.empty:
         st.success(f"主数据: {len(df_master)} 条")
-        st.caption(f"连锁索引: {len(chain_groups)} 个品牌")
 
 # --- 主流程 ---
 if st.session_state.final_result_df is None:
@@ -268,27 +321,41 @@ if st.session_state.final_result_df is None:
         
         with c1:
             col_name = st.selectbox("📍 药房名称", cols, index=get_idx('name_col'))
-            col_chain = st.selectbox("🔗 连锁名称 (可选)", [None]+cols, index=cols.index(map_res['chain_col'])+1 if map_res.get('chain_col') in cols else 0)
+            col_chain = st.selectbox("🔗 连锁名称", [None]+cols, index=cols.index(map_res['chain_col'])+1 if map_res.get('chain_col') in cols else 0)
         with c2:
-            col_prov = st.selectbox("🗺️ 省份 (可选)", [None]+cols, index=cols.index(map_res['prov_col'])+1 if map_res.get('prov_col') in cols else 0)
-            col_city = st.selectbox("🏙️ 城市 (可选)", [None]+cols, index=cols.index(map_res['city_col'])+1 if map_res.get('city_col') in cols else 0)
+            col_prov = st.selectbox("🗺️ 省份", [None]+cols, index=cols.index(map_res['prov_col'])+1 if map_res.get('prov_col') in cols else 0)
+            col_city = st.selectbox("🏙️ 城市", [None]+cols, index=cols.index(map_res['city_col'])+1 if map_res.get('city_col') in cols else 0)
         with c3:
-            col_dist = st.selectbox("🏘️ 区县 (可选)", [None]+cols, index=cols.index(map_res['dist_col'])+1 if map_res.get('dist_col') in cols else 0)
-            col_addr = st.selectbox("🏠 详细地址 (可选)", [None]+cols, index=cols.index(map_res['addr_col'])+1 if map_res.get('addr_col') in cols else 0)
+            col_dist = st.selectbox("🏘️ 区县", [None]+cols, index=cols.index(map_res['dist_col'])+1 if map_res.get('dist_col') in cols else 0)
+            col_addr = st.selectbox("🏠 详细地址", [None]+cols, index=cols.index(map_res['addr_col'])+1 if map_res.get('addr_col') in cols else 0)
 
         mapping = {'prov': col_prov, 'city': col_city, 'dist': col_dist, 'addr': col_addr, 'chain': col_chain, 'name': col_name}
 
-        # --- 3. 预处理分流 ---
-        st.markdown("### ⚡ 3. 执行匹配")
+        # --- 3. 预处理与重排 ---
+        st.markdown("### ⚡ 3. 分组重排与匹配")
         
-        # 全字匹配字典
+        # 🌟 核心：按照地理位置重排数据 (Regrouping)
+        # 这满足了“将上传的文件分组重排”的需求，使得处理过程在逻辑上是按区域进行的
+        sort_cols = []
+        if col_prov: sort_cols.append(col_prov)
+        if col_city: sort_cols.append(col_city)
+        if col_dist: sort_cols.append(col_dist)
+        
+        if sort_cols:
+            df_user_sorted = df_user.sort_values(by=sort_cols).reset_index(drop=True)
+            st.caption(f"✅ 已按 {sort_cols} 对数据进行分组重排，将按区域逐块匹配。")
+        else:
+            df_user_sorted = df_user
+            st.caption("⚠️ 未检测到地理列，将按原始顺序处理。")
+
+        # 全字匹配准备
         master_exact = df_master.drop_duplicates(subset=['标准名称']).set_index('标准名称').to_dict('index')
         
         exact_rows = []
         rem_indices = []
         
         # 预扫描
-        for idx, row in df_user.iterrows():
+        for idx, row in df_user_sorted.iterrows():
             raw_name = str(row[col_name]).strip()
             chain_name = str(row[col_chain]).strip() if col_chain and pd.notna(row[col_chain]) else ""
             search_name = raw_name
@@ -303,18 +370,15 @@ if st.session_state.final_result_df is None:
                 rem_indices.append(idx)
         
         df_exact = pd.DataFrame(exact_rows)
-        df_rem = df_user.loc[rem_indices].copy()
+        df_rem = df_user_sorted.loc[rem_indices].copy()
         
-        st.markdown(f"""
-        <div class="success-box">✅ <b>已自动命中 {len(df_exact)} 行</b></div>
-        <div class="info-box">⏳ <b>剩余 {len(df_rem)} 行</b> 待模型处理</div>
-        """, unsafe_allow_html=True)
+        st.info(f"预处理完成：自动命中 {len(df_exact)} 行，剩余 {len(df_rem)} 行待分层模型匹配。")
         
-        btn_txt = f"🚀 开始处理剩余 {len(df_rem)} 行" if len(df_rem) > 0 else "✨ 生成结果"
+        btn_txt = f"🚀 开始分层匹配 ({len(df_rem)} 行)" if len(df_rem) > 0 else "✨ 生成结果"
         
         if st.button(btn_txt, type="primary"):
             ai_rows = []
-            stats = {'exact': len(df_exact), 'high': 0, 'low': 0, 'no_match': 0}
+            stats = {'exact': len(df_exact), 'high': 0, 'mid': 0, 'low': 0, 'no_match': 0}
             
             if len(df_rem) > 0:
                 prog = st.progress(0)
@@ -322,17 +386,26 @@ if st.session_state.final_result_df is None:
                 
                 for i, (orig_idx, row) in enumerate(df_rem.iterrows()):
                     try:
+                        # 准备数据
                         raw_name = str(row[col_name]).strip()
                         chain_name = str(row[col_chain]).strip() if col_chain and pd.notna(row[col_chain]) else ""
                         search_name = raw_name
                         if chain_name and chain_name not in raw_name: search_name = f"{chain_name} {raw_name}"
+                        
+                        # 传递原始地址给 Prompt 做辅助
+                        row_with_meta = row.copy()
+                        if col_addr: row_with_meta['地址列_raw'] = str(row[col_addr])
 
-                        # 🌟 调用安全版检索
-                        indices, scope = get_candidates_hybrid_safe(search_name, chain_name, df_master, geo_index, chain_groups, row, mapping)
+                        # 🌟 调用分层检索 (Hierarchical)
+                        indices, scope_desc = get_candidates_hierarchical(
+                            search_name, chain_name, df_master, 
+                            prov_groups, city_groups, dist_groups, chain_groups, 
+                            row, mapping
+                        )
                         
                         base_res = row.to_dict()
                         if not indices:
-                            base_res.update({"匹配ESID": None, "匹配标准名": None, "机构类型": None, "置信度": "Low", "匹配方式": "无结果", "理由": "无候选"})
+                            base_res.update({"匹配ESID": None, "匹配标准名": None, "机构类型": None, "置信度": "Low", "匹配方式": "无结果", "理由": f"范围[{scope_desc}]内无候选"})
                             stats['no_match'] += 1
                         else:
                             try:
@@ -341,10 +414,11 @@ if st.session_state.final_result_df is None:
                                 candidates = pd.DataFrame()
 
                             if candidates.empty:
-                                base_res.update({"匹配ESID": None, "匹配标准名": None, "机构类型": None, "置信度": "Low", "匹配方式": "无结果", "理由": "索引错误"})
+                                base_res.update({"匹配ESID": None, "匹配标准名": None, "机构类型": None, "置信度": "Low", "匹配方式": "无结果", "理由": "索引异常"})
                                 stats['no_match'] += 1
                             else:
-                                ai_res = ai_match_row_expert(client, row, search_name, chain_name, scope, candidates)
+                                # 🌟 调用 V3 Prompt (High/Mid/Low)
+                                ai_res = ai_match_row_v3(client, row_with_meta, search_name, chain_name, scope_desc, candidates)
                                 if isinstance(ai_res, list): ai_res = ai_res[0] if ai_res else {}
                                 
                                 conf = ai_res.get("confidence", "Low")
@@ -353,21 +427,22 @@ if st.session_state.final_result_df is None:
                                     "匹配标准名": ai_res.get("match_name"),
                                     "机构类型": ai_res.get("match_type"),
                                     "置信度": conf,
-                                    "匹配方式": "模型匹配",
+                                    "匹配方式": f"模型 ({scope_desc})",
                                     "理由": ai_res.get("reason")
                                 })
                                 
                                 if conf == "High": stats['high'] += 1
+                                elif conf == "Mid": stats['mid'] += 1
                                 else: stats['low'] += 1
                                 
                                 time.sleep(1.5)
                         
                         ai_rows.append(base_res)
                         prog.progress((i+1)/len(df_rem))
-                        status.text(f"Processing ({i+1}/{len(df_rem)}): {search_name}")
+                        status.text(f"[{scope_desc}] Processing: {search_name}")
                         
                     except Exception as e:
-                        st.warning(f"跳过行 {orig_idx}: {e}")
+                        st.warning(f"跳过行: {e}")
             
             # 合并结果
             if ai_rows:
@@ -380,7 +455,7 @@ if st.session_state.final_result_df is None:
             st.session_state.match_stats = stats
             st.rerun()
 
-# --- 4. 结果展示 (修复了 f-string 错误) ---
+# --- 4. 结果展示 ---
 if st.session_state.final_result_df is not None:
     s = st.session_state.match_stats
     total = s.get('total', 0)
@@ -389,53 +464,65 @@ if st.session_state.final_result_df is not None:
     
     st.markdown("### 📊 匹配统计报告")
     
-    col1, col2, col3, col4 = st.columns(4)
+    # 提前计算比率
+    exact_val = s.get('exact', 0)
+    model_done = s.get('high', 0) + s.get('mid', 0) + s.get('low', 0)
     
-    # 提前计算比率，避免 f-string 语法错误
-    exact_pct = s.get('exact', 0) / total
-    model_done = s.get('high', 0) + s.get('low', 0)
-    model_pct = model_done / total
-    high_pct = s.get('high', 0) / model_done if model_done > 0 else 0.0
-    low_pct = s.get('low', 0) / model_done if model_done > 0 else 0.0
-
+    # 防止分母为0
+    model_denom = model_done if model_done > 0 else 1
+    
+    col1, col2, col3, col4, col5 = st.columns(5)
+    
     with col1:
         st.markdown(f"""
         <div class="stat-card">
             <div class="sub-text">🎯 全字匹配</div>
-            <div class="big-num">{s.get('exact', 0)} 行</div>
-            <div style="color:green; font-weight:bold;">{exact_pct:.1%}</div>
+            <div class="big-num">{exact_val}</div>
+            <div style="color:green; font-weight:bold;">{exact_val/total:.1%}</div>
         </div>""", unsafe_allow_html=True)
     with col2:
         st.markdown(f"""
         <div class="stat-card">
-            <div class="sub-text">🤖 模型处理</div>
-            <div class="big-num">{model_done} 行</div>
-            <div style="color:blue; font-weight:bold;">{model_pct:.1%}</div>
+            <div class="sub-text">🤖 模型总计</div>
+            <div class="big-num">{model_done}</div>
+            <div style="color:blue; font-weight:bold;">{model_done/total:.1%}</div>
         </div>""", unsafe_allow_html=True)
     with col3:
+        h_val = s.get('high', 0)
         st.markdown(f"""
         <div class="stat-card">
-            <div class="sub-text">🔥 High 置信度</div>
-            <div class="big-num">{s.get('high', 0)} 行</div>
-            <div class="sub-text">占模型: {high_pct:.1%}</div>
+            <div class="sub-text">🔥 High</div>
+            <div class="big-num">{h_val}</div>
+            <div class="sub-text">占模型: {h_val/model_denom:.1%}</div>
         </div>""", unsafe_allow_html=True)
     with col4:
+        m_val = s.get('mid', 0)
         st.markdown(f"""
         <div class="stat-card">
-            <div class="sub-text">⚠️ Low 置信度</div>
-            <div class="big-num">{s.get('low', 0)} 行</div>
-            <div class="sub-text">占模型: {low_pct:.1%}</div>
+            <div class="sub-text">⚖️ Mid</div>
+            <div class="big-num">{m_val}</div>
+            <div class="sub-text">占模型: {m_val/model_denom:.1%}</div>
+        </div>""", unsafe_allow_html=True)
+    with col5:
+        l_val = s.get('low', 0)
+        st.markdown(f"""
+        <div class="stat-card">
+            <div class="sub-text">⚠️ Low</div>
+            <div class="big-num">{l_val}</div>
+            <div class="sub-text">占模型: {l_val/model_denom:.1%}</div>
         </div>""", unsafe_allow_html=True)
 
     st.divider()
     
     def color_row(row):
-        if row.get('匹配方式') == '全字匹配': return ['background-color: #dcfce7'] * len(row)
-        if row.get('置信度') == 'High': return ['background-color: #e0f2fe'] * len(row)
+        conf = row.get('置信度')
+        if conf == 'High': return ['background-color: #dcfce7'] * len(row) # 绿
+        if conf == 'Mid': return ['background-color: #fef9c3'] * len(row)  # 黄
+        if conf == 'Low': return ['background-color: #fee2e2'] * len(row)  # 红
         return [''] * len(row)
 
     df_show = st.session_state.final_result_df
     st.dataframe(df_show.style.apply(color_row, axis=1), use_container_width=True)
     
     csv = df_show.to_csv(index=False).encode('utf-8-sig')
-    st.download_button("📥 下载完整报告", csv, "linkmed_expert_result.csv", "text/csv", type="primary")
+    st.download_button("📥 下载结果 (含 High/Mid/Low)", csv, "linkmed_hierarchical.csv", "text/csv", type="primary")
