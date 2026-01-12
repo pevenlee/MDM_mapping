@@ -3,3 +3,4 @@ pandas
 google-genai
 rapidfuzz
 openpyxl
+tabulate
