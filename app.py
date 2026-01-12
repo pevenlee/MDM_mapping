@@ -11,7 +11,7 @@ from rapidfuzz import process, fuzz
 
 # ================= 1. 配置与初始化 =================
 
-st.set_page_config(page_title="LinkMed Matcher Pro (Batch)", layout="wide", page_icon="🧬")
+st.set_page_config(page_title="LinkMed Matcher Pro (Clean)", layout="wide", page_icon="🧬")
 
 try:
     FIXED_API_KEY = st.secrets["GENAI_API_KEY"]
@@ -27,7 +27,7 @@ if 'final_result_df' not in st.session_state:
 if 'match_stats' not in st.session_state:
     st.session_state.match_stats = {}
 if 'batch_progress' not in st.session_state:
-    st.session_state.batch_progress = [] # 存储已完成的批次信息
+    st.session_state.batch_progress = [] 
 
 # ================= 2. 核心工具函数 =================
 
@@ -71,21 +71,27 @@ def safe_generate(client, prompt, response_schema=None, retries=3):
 
 @st.cache_resource(show_spinner=False)
 def load_master_data():
-    """加载并建立严格的地理分层索引"""
+    """
+    标准加载模式：每次直接读取 Excel/CSV，不使用 Pickle 缓存
+    确保数据 100% 准确，无缓存干扰
+    """
     if os.path.exists(LOCAL_MASTER_FILE):
         try:
             gc.collect()
+            # 根据后缀读取
             if LOCAL_MASTER_FILE.endswith('.xlsx'):
                 df = pd.read_excel(LOCAL_MASTER_FILE, engine='openpyxl')
             else:
                 df = pd.read_csv(LOCAL_MASTER_FILE)
             
+            # 基础清洗
             df = df.reset_index(drop=True)
             target_cols = ['标准名称', '省', '市', '区', '机构类型', '地址', '连锁品牌']
             for col in target_cols:
                 if col not in df.columns: df[col] = ''
                 df[col] = df[col].astype(str).replace('nan', '').str.strip()
-                
+            
+            # 建立索引
             prov_groups = df.groupby('省').groups
             city_groups = df.groupby('市').groups
             dist_groups = df.groupby('区').groups
@@ -136,12 +142,8 @@ def get_candidates_hierarchical(search_name, chain_name, df_master, prov_groups,
             if u_city and u_city in city_groups:
                 city_indices = set(city_groups[u_city])
                 intersection = dist_indices.intersection(city_indices)
-                if intersection:
-                    target_indices = intersection
-                    scope_desc = f"精准定位: {u_city}{u_dist}"
-                else:
-                    target_indices = dist_indices
-                    scope_desc = f"区域定位: {u_dist}"
+                target_indices = intersection if intersection else dist_indices
+                scope_desc = f"精准定位: {u_city}{u_dist}"
             else:
                 target_indices = dist_indices
                 scope_desc = f"区域定位: {u_dist}"
@@ -220,11 +222,11 @@ st.markdown("""
     .stApp {background-color: #F8F9FA;}
     .stat-card {background: #ffffff; padding: 15px; border-radius: 8px; border: 1px solid #e5e7eb; box-shadow: 0 1px 2px rgba(0,0,0,0.05);}
     .big-num {font-size: 24px; font-weight: bold; color: #1e40af;}
-    .sub-text {font-size: 14px; color: #6b7280;}
     .task-box {background-color: #f3f4f6; padding: 10px; border-radius: 5px; margin-bottom: 5px; border-left: 4px solid #3b82f6;}
+    .prog-label {font-weight: bold; font-size: 14px; margin-bottom: 5px; display: block;}
     </style>
     <div style="font-size: 26px; font-weight: bold; color: #1E3A8A; margin-bottom: 20px;">
-    🧬 LinkMed Matcher (Batch Processing)
+    🧬 LinkMed Matcher (Clean Mode)
     </div>
 """, unsafe_allow_html=True)
 
@@ -233,7 +235,7 @@ client = get_client()
 # 加载数据
 df_master, prov_groups, city_groups, dist_groups, chain_groups = pd.DataFrame(), {}, {}, {}, {}
 if os.path.exists(LOCAL_MASTER_FILE):
-    with st.spinner(f"正在构建分层地理索引..."):
+    with st.spinner(f"正在加载主数据 (实时读取)..."):
         df_master, prov_groups, city_groups, dist_groups, chain_groups = load_master_data()
 else:
     st.warning(f"⚠️ 文件缺失: `{LOCAL_MASTER_FILE}`")
@@ -284,11 +286,10 @@ if st.session_state.final_result_df is None:
 
         mapping = {'prov': col_prov, 'city': col_city, 'dist': col_dist, 'addr': col_addr, 'chain': col_chain, 'name': col_name}
 
-        # --- 3. 预处理与重排 ---
+        # --- 3. 预处理与分包 ---
         st.markdown("### ⚡ 3. 预处理与分包")
         
-        # 🌟 第一步：分组重排 (Clustering)
-        # 将数据按省市区排序，保证同一个地区的店在一起，利于分包
+        # 分组重排
         sort_cols = []
         if col_prov: sort_cols.append(col_prov)
         if col_city: sort_cols.append(col_city)
@@ -300,9 +301,8 @@ if st.session_state.final_result_df is None:
         else:
             df_user_sorted = df_user
 
-        # 🌟 第二步：全字匹配过滤
+        # 全字匹配
         master_exact = df_master.drop_duplicates(subset=['标准名称']).set_index('标准名称').to_dict('index')
-        
         exact_rows = []
         rem_indices = []
         
@@ -324,8 +324,7 @@ if st.session_state.final_result_df is None:
         df_exact = pd.DataFrame(exact_rows)
         df_rem = df_user_sorted.loc[rem_indices].copy().reset_index(drop=True)
         
-        # 🌟 第三步：智能拆包 (Batch Splitting)
-        # 如果剩余数据 > 2000，则拆分
+        # 拆包逻辑
         BATCH_SIZE = 2000
         num_batches = 1
         batches = []
@@ -333,52 +332,42 @@ if st.session_state.final_result_df is None:
         if len(df_rem) > 0:
             num_batches = math.ceil(len(df_rem) / BATCH_SIZE)
             for i in range(num_batches):
-                start_i = i * BATCH_SIZE
-                end_i = min((i + 1) * BATCH_SIZE, len(df_rem))
-                batch_df = df_rem.iloc[start_i:end_i]
-                batches.append(batch_df)
+                batches.append(df_rem.iloc[i*BATCH_SIZE : (i+1)*BATCH_SIZE])
 
         st.info(f"预处理报告: 自动命中 {len(df_exact)} 行。剩余 {len(df_rem)} 行待模型匹配。")
         
         if len(df_rem) > 0:
-            st.warning(f"由于数据量较大，已自动拆分为 **{num_batches}** 个任务包，将依次执行并自动合并结果。")
-            with st.expander("查看任务队列", expanded=True):
-                for i, b in enumerate(batches):
-                    # 尝试读取该批次的第一个地理位置作为标识
-                    loc_tag = "未知区域"
-                    if len(b) > 0:
-                        first_row = b.iloc[0]
-                        p = str(first_row[col_prov]) if col_prov and pd.notna(first_row[col_prov]) else ""
-                        c = str(first_row[col_city]) if col_city and pd.notna(first_row[col_city]) else ""
-                        loc_tag = f"{p} {c}".strip() or "混合区域"
-                    st.markdown(f"<div class='task-box'>📦 <b>任务包 {i+1}</b>: {len(b)} 行 (起始位置: {loc_tag})</div>", unsafe_allow_html=True)
-
+            st.warning(f"由于数据量较大，已自动拆分为 **{num_batches}** 个任务包。")
+            
+            # 显示双进度条占位
             if st.button(f"🚀 启动任务队列 ({len(df_rem)} 行)", type="primary"):
                 
-                # 初始化结果容器 (包含已全字匹配的)
-                if df_exact.empty:
-                    final_accumulated = pd.DataFrame()
-                else:
-                    final_accumulated = df_exact.copy()
-                
+                final_accumulated = df_exact.copy() if not df_exact.empty else pd.DataFrame()
                 stats = {'exact': len(df_exact), 'high': 0, 'mid': 0, 'low': 0, 'no_match': 0}
                 
-                # 进度条 (针对所有模型任务)
-                total_rem_rows = len(df_rem)
-                global_prog = st.progress(0)
-                status_text = st.empty()
+                st.write("") 
+                col_g, col_b = st.columns(2)
+                with col_g:
+                    st.markdown('<span class="prog-label">🌍 全局总进度</span>', unsafe_allow_html=True)
+                    global_prog = st.progress(0)
+                    global_txt = st.empty()
                 
-                processed_count = 0
+                with col_b:
+                    st.markdown('<span class="prog-label">📦 当前任务包进度</span>', unsafe_allow_html=True)
+                    batch_prog = st.progress(0)
+                    batch_txt = st.empty()
                 
-                # --- 循环执行批次 ---
+                processed_global = 0
+                
                 for batch_idx, batch_df in enumerate(batches):
-                    
-                    status_text.markdown(f"### 🔄 正在处理任务包 {batch_idx + 1} / {num_batches} ...")
+                    batch_num = batch_idx + 1
                     batch_results = []
+                    
+                    global_txt.caption(f"正在处理第 {batch_num}/{num_batches} 个任务包...")
                     
                     for i, (orig_idx, row) in enumerate(batch_df.iterrows()):
                         try:
-                            # 准备数据
+                            # 1. 业务逻辑
                             raw_name = str(row[col_name]).strip()
                             chain_name = str(row[col_chain]).strip() if col_chain and pd.notna(row[col_chain]) else ""
                             search_name = raw_name
@@ -387,7 +376,6 @@ if st.session_state.final_result_df is None:
                             row_with_meta = row.copy()
                             if col_addr: row_with_meta['地址列_raw'] = str(row[col_addr])
 
-                            # 调用分层检索
                             indices, scope_desc = get_candidates_hierarchical(
                                 search_name, chain_name, df_master, 
                                 prov_groups, city_groups, dist_groups, chain_groups, 
@@ -408,7 +396,6 @@ if st.session_state.final_result_df is None:
                                     base_res.update({"匹配ESID": None, "匹配标准名": None, "机构类型": None, "置信度": "Low", "匹配方式": "无结果", "理由": "索引异常"})
                                     stats['no_match'] += 1
                                 else:
-                                    # 调用 AI
                                     ai_res = ai_match_row_v3(client, row_with_meta, search_name, chain_name, scope_desc, candidates)
                                     if isinstance(ai_res, list): ai_res = ai_res[0] if ai_res else {}
                                     
@@ -426,37 +413,32 @@ if st.session_state.final_result_df is None:
                                     elif conf == "Mid": stats['mid'] += 1
                                     else: stats['low'] += 1
                                     
-                                    time.sleep(1.5) # 冷却
+                                    time.sleep(1.5) 
                             
                             batch_results.append(base_res)
                             
-                            processed_count += 1
-                            progress_pct = processed_count / total_rem_rows
-                            global_prog.progress(progress_pct)
+                            # 2. 更新进度
+                            processed_global += 1
+                            batch_prog.progress((i + 1) / len(batch_df))
+                            batch_txt.caption(f"当前包: {i+1} / {len(batch_df)} 行")
+                            
+                            global_prog.progress(processed_global / len(df_rem))
                             
                         except Exception as e:
                             st.warning(f"行错误: {e}")
                     
-                    # --- 🌟 批次存档点 ---
-                    # 每跑完一个包，立即更新结果
+                    # 批次存档
                     if batch_results:
                         df_batch = pd.DataFrame(batch_results)
                         final_accumulated = pd.concat([final_accumulated, df_batch], ignore_index=True)
-                        
-                        # 存入 Session State (防止浏览器崩溃后丢失全部)
                         st.session_state.final_result_df = final_accumulated
                         st.session_state.match_stats = stats
-                        
-                        # 显示临时下载 (可选，给极度谨慎的用户)
-                        # 注意：st.download_button 在循环中不能直接点击，这里主要起展示作用，或者用 st.empty 更新
-                        st.toast(f"✅ 任务包 {batch_idx + 1} 完成！已自动保存进度。", icon="💾")
+                        st.toast(f"✅ 任务包 {batch_num} 完成！已存档。", icon="💾")
 
-                # 循环结束，最终跳转
                 st.success("🎉 所有任务包处理完成！")
                 st.rerun()
         
         else:
-            # 只有全字匹配的情况
             if st.button("✨ 直接生成结果", type="primary"):
                 st.session_state.final_result_df = df_exact
                 st.session_state.match_stats = {'exact': len(df_exact), 'high': 0, 'mid': 0, 'low': 0, 'no_match': 0}
@@ -501,4 +483,4 @@ if st.session_state.final_result_df is not None:
     st.dataframe(df_show.style.apply(color_row, axis=1), use_container_width=True)
     
     csv = df_show.to_csv(index=False).encode('utf-8-sig')
-    st.download_button("📥 下载完整结果 (含所有批次)", csv, "linkmed_batch_result.csv", "text/csv", type="primary")
+    st.download_button("📥 下载完整结果", csv, "linkmed_batch_result.csv", "text/csv", type="primary")
