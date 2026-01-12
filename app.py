@@ -65,7 +65,7 @@ def safe_generate(client, prompt, response_schema=None, retries=3):
                 response_schema=response_schema
             )
             response = client.models.generate_content(
-                model="gemini-2.0-flash", 
+                model="gemini-3-pro-preview", 
                 contents=prompt,
                 config=config
             )
@@ -197,7 +197,7 @@ def ai_match_row_v3(client, user_row, search_name, chain_name, scope_desc, candi
     candidates_json = candidates_df[valid_cols].to_json(orient="records", force_ascii=False)
     
     prompt = f"""
-    【角色】主数据匹配专家。
+    【角色】药房主数据匹配专家。
     【待匹配实体】
     - 组合名称: "{search_name}"
     - 连锁品牌: "{chain_name}"
@@ -214,6 +214,7 @@ def ai_match_row_v3(client, user_row, search_name, chain_name, scope_desc, candi
        
     【特殊规则】
     - **总部陷阱**: 除非用户找总部，否则不要匹配"总公司"。优先匹配门店。
+    - 当匹配不上时，通过药店信息中的 XX店，去主数据的地址中寻找，如果主数据中的地址包含XX，则模糊匹配上
     
     【输出 JSON】:
     {{ "match_esid": "...", "match_name": "...", "match_type": "...", "confidence": "High/Mid/Low", "reason": "..." }}
@@ -532,3 +533,4 @@ if st.session_state.final_result_df is not None:
     
     csv = df_show.to_csv(index=False).encode('utf-8-sig')
     st.download_button("📥 下载完整结果", csv, "linkmed_batch_result.csv", "text/csv", type="primary")
+
