@@ -27,7 +27,7 @@ if 'final_result_df' not in st.session_state:
     st.session_state.final_result_df = None
 if 'match_stats' not in st.session_state:
     st.session_state.match_stats = {}
-# 新增：用于存储拆分好的任务状态，防止刷新丢失
+# 用于存储拆分好的任务状态
 if 'prep_done' not in st.session_state:
     st.session_state.prep_done = False
 if 'df_exact' not in st.session_state:
@@ -189,7 +189,6 @@ def get_candidates_hierarchical(search_name, chain_name, df_master, prov_groups,
         return list(candidates_indices), scope_desc
     
     except Exception as e:
-        # print(f"Retrieval Error: {e}")
         return [], "Error"
 
 def ai_match_row_v3(client, user_row, search_name, chain_name, scope_desc, candidates_df):
@@ -295,14 +294,14 @@ if st.session_state.final_result_df is None:
 
         mapping = {'prov': col_prov, 'city': col_city, 'dist': col_dist, 'addr': col_addr, 'chain': col_chain, 'name': col_name}
 
-        # --- 3. 预处理与分包 (优化防崩版) ---
+        # --- 3. 预处理与分包 ---
         st.markdown("### ⚡ 3. 预处理与分包")
         
         if not st.session_state.prep_done:
             if st.button("🏁 开始预处理分析", type="primary"):
                 with st.spinner("正在进行极速分析与拆包..."):
                     try:
-                        # 1. 安全数据清洗 (防止崩溃核心)
+                        # 1. 安全数据清洗
                         df_safe = df_user.copy()
                         for c in [col_name, col_chain, col_prov, col_city, col_dist, col_addr]:
                             if c:
@@ -316,8 +315,7 @@ if st.session_state.final_result_df is None:
                         if sort_cols:
                             df_safe = df_safe.sort_values(by=sort_cols).reset_index(drop=True)
 
-                        # 3. 向量化全字匹配 (Vectorized Exact Match) - 极速！
-                        # 避免使用 iterrows，改用 pandas apply
+                        # 3. 向量化全字匹配 (Vectorized Exact Match)
                         master_exact = df_master.drop_duplicates(subset=['标准名称']).set_index('标准名称').to_dict('index')
                         
                         def check_exact(row):
@@ -351,7 +349,7 @@ if st.session_state.final_result_df is None:
                         # 4. 拆分批次
                         batches = []
                         if len(df_rem) > 0:
-                            BATCH_SIZE = 1000 # 调小一点更稳
+                            BATCH_SIZE = 1000 
                             num_batches = math.ceil(len(df_rem) / BATCH_SIZE)
                             for i in range(num_batches):
                                 batches.append(df_rem.iloc[i*BATCH_SIZE : (i+1)*BATCH_SIZE])
@@ -378,7 +376,6 @@ if st.session_state.final_result_df is None:
                 # 可折叠的任务预览
                 with st.expander(f"👁️ 查看 {len(batches)} 个任务包详情", expanded=False):
                     for i, b in enumerate(batches):
-                        # 尝试获取该包的地理标签
                         tag = "混合区域"
                         if len(b) > 0:
                             r = b.iloc[0]
@@ -442,4 +439,96 @@ if st.session_state.final_result_df is None:
                                     candidates = df_master.loc[indices].copy()
                                     if candidates.empty:
                                         base_res.update({"匹配ESID": None, "匹配标准名": None, "机构类型": None, "置信度": "Low", "匹配方式": "无结果", "理由": "索引异常"})
-                                        stats['no_
+                                        stats['no_match'] += 1
+                                    else:
+                                        # AI 匹配
+                                        ai_res = ai_match_row_v3(client, row_with_meta, search_name, chain_name, scope_desc, candidates)
+                                        if isinstance(ai_res, list): ai_res = ai_res[0] if ai_res else {}
+                                        
+                                        conf = ai_res.get("confidence", "Low")
+                                        base_res.update({
+                                            "匹配ESID": ai_res.get("match_esid"),
+                                            "匹配标准名": ai_res.get("match_name"),
+                                            "机构类型": ai_res.get("match_type"),
+                                            "置信度": conf,
+                                            "匹配方式": f"模型 ({scope_desc})",
+                                            "理由": ai_res.get("reason")
+                                        })
+                                        
+                                        if conf == "High": stats['high'] += 1
+                                        elif conf == "Mid": stats['mid'] += 1
+                                        else: stats['low'] += 1
+                                        
+                                        time.sleep(1.5) # 冷却
+                                
+                                batch_results.append(base_res)
+                                
+                                # 更新进度
+                                processed_global += 1
+                                batch_prog.progress((i + 1) / len(batch_df))
+                                batch_txt.caption(f"进度: {i+1}/{len(batch_df)}")
+                                global_prog.progress(processed_global / count_rem)
+                                
+                            except Exception as e:
+                                pass
+                        
+                        # --- 批次存档 ---
+                        if batch_results:
+                            df_batch = pd.DataFrame(batch_results)
+                            final_accumulated = pd.concat([final_accumulated, df_batch], ignore_index=True)
+                            st.session_state.final_result_df = final_accumulated
+                            st.session_state.match_stats = stats
+                            st.toast(f"✅ 任务包 {batch_num} 完成并存档", icon="💾")
+                            del df_batch
+                            gc.collect()
+
+                    st.success("🎉 所有任务处理完成！")
+                    st.rerun()
+            
+            else:
+                # 只有全字匹配
+                if st.button("✨ 直接生成结果", type="primary"):
+                    st.session_state.final_result_df = st.session_state.df_exact
+                    st.session_state.match_stats = {'exact': count_exact, 'high': 0, 'mid': 0, 'low': 0, 'no_match': 0}
+                    st.rerun()
+
+# --- 4. 结果展示 ---
+if st.session_state.final_result_df is not None:
+    s = st.session_state.match_stats
+    total = len(st.session_state.final_result_df)
+    if total == 0: total = 1
+    
+    st.markdown("### 📊 匹配统计报告")
+    
+    exact_val = s.get('exact', 0)
+    exact_pct = exact_val / total
+    
+    model_done = s.get('high', 0) + s.get('mid', 0) + s.get('low', 0)
+    model_pct = model_done / total
+    model_denom = model_done if model_done > 0 else 1
+    
+    high_pct = s.get('high', 0) / model_denom
+    mid_pct = s.get('mid', 0) / model_denom
+    low_pct = s.get('low', 0) / model_denom
+    
+    c1, c2, c3, c4, c5 = st.columns(5)
+    with c1: st.metric("🎯 全字匹配", f"{exact_val}", f"{exact_pct:.1%}")
+    with c2: st.metric("🤖 模型总计", f"{model_done}", f"{model_pct:.1%}")
+    with c3: st.metric("🔥 High", f"{s.get('high', 0)}", f"{high_pct:.1%} (of Model)")
+    with c4: st.metric("⚖️ Mid", f"{s.get('mid', 0)}", f"{mid_pct:.1%} (of Model)")
+    with c5: st.metric("⚠️ Low", f"{s.get('low', 0)}", f"{low_pct:.1%} (of Model)")
+
+    st.divider()
+    
+    def color_row(row):
+        conf = row.get('置信度')
+        if conf == 'High': return ['background-color: #dcfce7'] * len(row)
+        if conf == 'Mid': return ['background-color: #fef9c3'] * len(row)
+        if conf == 'Low': return ['background-color: #fee2e2'] * len(row)
+        return [''] * len(row)
+
+    df_show = st.session_state.final_result_df
+    st.dataframe(df_show.style.apply(color_row, axis=1), use_container_width=True)
+    
+    csv = df_show.to_csv(index=False).encode('utf-8-sig')
+    st.download_button("📥 下载完整结果", csv, "linkmed_batch_result.csv", "text/csv", type="primary")
