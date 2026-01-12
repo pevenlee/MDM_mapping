@@ -1,7 +1,5 @@
 streamlit
 pandas
 google-genai
-numpy
-matplotlib
-seaborn
+rapidfuzz
 openpyxl
