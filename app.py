@@ -16,7 +16,7 @@ try:
 except:
     FIXED_API_KEY = "" 
 
-# ✅ 修改 1: 指向 Excel 文件
+# ✅ 指向 Excel 文件
 LOCAL_MASTER_FILE = "MDM_retail.xlsx"
 
 # ================= 2. 核心工具函数 =================
@@ -46,7 +46,7 @@ def load_master_data():
     """加载主数据，支持 xlsx 和 csv"""
     if os.path.exists(LOCAL_MASTER_FILE):
         try:
-            # ✅ 修改 2: 根据后缀自动选择读取引擎
+            # ✅ 根据后缀自动选择读取引擎
             if LOCAL_MASTER_FILE.endswith('.xlsx'):
                 df = pd.read_excel(LOCAL_MASTER_FILE)
             else:
@@ -181,11 +181,15 @@ if uploaded_file and not df_master.empty:
             progress_bar = st.progress(0)
             status_text = st.empty()
             
-            # ✅ 优化策略 1: 构建全字匹配字典 (O(1) 查找)
-            # 这里的 value 存储我们需要的整行数据，方便直接提取
-            master_exact_lookup = df_master.set_index('标准名称').to_dict('index')
+            # ✅ 优化策略: 构建全字匹配字典 (已加入去重逻辑)
+            # 1. 显式去除重复的'标准名称'，保留第一次出现的行
+            df_master_unique = df_master.drop_duplicates(subset=['标准名称'], keep='first')
+            
+            # 2. 安全转换为字典，避免 ValueError
+            master_exact_lookup = df_master_unique.set_index('标准名称').to_dict('index')
             
             # 准备模糊搜索的 choices (只用于未命中的情况)
+            # 注意：模糊匹配时是否去重取决于你的业务需求，通常保留全部候选项更好
             master_choices = df_master['标准名称'].fillna('').astype(str).to_dict()
             
             exact_count = 0
