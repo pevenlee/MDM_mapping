@@ -118,7 +118,7 @@ def smart_map_columns(client, df_user):
     user_cols = df_user.columns.tolist()
     sample_data = df_user.head(3).to_markdown(index=False)
     prompt = f"""
-    分析用户数据，找出以下字段对应的列名。
+    分析用户数据，找出以下字段对应的列名（可能涉及中英文转化）。
     用户列名: {user_cols}
     预览: {sample_data}
     任务：找出以下列（无则null）：
@@ -533,6 +533,7 @@ if st.session_state.final_result_df is not None:
     
     csv = df_show.to_csv(index=False).encode('utf-8-sig')
     st.download_button("📥 下载完整结果", csv, "linkmed_batch_result.csv", "text/csv", type="primary")
+
 
 
 
