@@ -17,7 +17,7 @@ except:
     FIXED_API_KEY = "" 
 
 # 本地主数据文件名
-LOCAL_MASTER_FILE = "MDM_retial.csv"
+LOCAL_MASTER_FILE = "MDM_retail.csv"
 
 # ================= 2. 核心工具函数 =================
 
