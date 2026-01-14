@@ -18,7 +18,7 @@ try:
 except:
     FIXED_API_KEY = "" 
 
-LOCAL_MASTER_FILE = "MDM_retail.xlsx"
+LOCAL_MASTER_FILE = "MDM_hospital.xlsx"
 
 # --- Session State ---
 if 'uploader_key' not in st.session_state: st.session_state.uploader_key = str(time.time())
@@ -590,3 +590,4 @@ if st.session_state.final_result_df is not None:
     
     csv = df_show.to_csv(index=False).encode('utf-8-sig')
     st.download_button("📥 下载结果文件", csv, "linkmed_final_result.csv", "text/csv", type="primary")
+
