@@ -94,7 +94,7 @@ def load_master_data():
             
             df = df.reset_index(drop=True)
             # 确保主数据关键列存在
-            target_cols = ['标准名称', '省', '市', '区', '机构类型', '地址', '连锁品牌']
+            target_cols = ['标准名称', '省', '市', '区', '机构类型', '地址']
             for col in target_cols:
                 if col not in df.columns: df[col] = ''
                 df[col] = df[col].astype(str).replace('nan', '').str.strip()
@@ -121,13 +121,12 @@ def smart_map_columns(client, df_user):
     sample_data = df_user.head(3).to_markdown(index=False)
     # 优化Prompt：让AI更精准识别
     prompt = f"""
-    分析药店数据表头。
+    分析医院数据表头。
     用户列名: {user_cols}
     预览: {sample_data}
     
     请推断以下字段对应哪一列（若无则null）：
-    1. name_col: 药房名称/终端名 (核心)
-    2. chain_col: 连锁/品牌 (如: 海王星辰, 大参林)
+    1. name_col: 医院名称 (核心)
     3. prov_col: 省份
     4. city_col: 城市
     5. dist_col: 区/县
@@ -590,5 +589,6 @@ if st.session_state.final_result_df is not None:
     
     csv = df_show.to_csv(index=False).encode('utf-8-sig')
     st.download_button("📥 下载结果文件", csv, "linkmed_final_result.csv", "text/csv", type="primary")
+
 
 
