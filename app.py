@@ -5,6 +5,7 @@ import time
 import os
 import gc
 import math
+import re
 from google import genai
 from google.genai import types
 from rapidfuzz import process, fuzz 
@@ -37,6 +38,37 @@ if 'stop_requested' not in st.session_state: st.session_state.stop_requested = F
 
 # ================= 2. 核心工具函数 =================
 
+# --- 新增：核心词提取工具 ---
+GENERIC_SUFFIXES = [
+    '有限公司', '股份有限公司', '有限责任公司', '分店', '分公司', '药房', 
+    '药店', '大药房', '大药店', '诊所', '卫生室', '卫生站', '服务站', 
+    '医务室', '门诊部', '门诊', '医院', '中心', '总店', '旗舰店', '二店', '一店'
+]
+
+def extract_core_keywords(text):
+    """
+    1. 去除括号内容
+    2. 去除通用后缀
+    3. 如果剩余长度太短，则返回原词
+    """
+    if not isinstance(text, str): return ""
+    
+    # 1. 去除括号及内容 (e.g., "某某医院(总店)" -> "某某医院")
+    text = re.sub(r"\(.*?\)|（.*?）|\[.*?\]|【.*?】", "", text)
+    
+    # 2. 循环去除后缀
+    clean_text = text
+    # 按长度降序排列后缀，优先匹配长的
+    sorted_suffixes = sorted(GENERIC_SUFFIXES, key=len, reverse=True)
+    
+    for suffix in sorted_suffixes:
+        if clean_text.endswith(suffix):
+            # 只有当去除后缀后剩余长度 >= 2 才去除
+            if len(clean_text) - len(suffix) >= 2:
+                clean_text = clean_text[:-len(suffix)]
+                
+    return clean_text.strip()
+
 def reset_app():
     """完全重置"""
     keys = ['final_result_df', 'match_stats', 'prep_done', 'mapping_confirmed', 'df_exact', 
@@ -66,7 +98,7 @@ def safe_generate(client, prompt, response_schema=None, retries=3):
                 response_schema=response_schema
             )
             response = client.models.generate_content(
-                model="gemini-3-pro-preview", 
+                model="gemini-2.0-flash-exp", # 推荐使用更快的模型
                 contents=prompt,
                 config=config
             )
@@ -105,9 +137,11 @@ def load_master_data():
             dist_groups = df.groupby('区').groups
             
             chain_groups = {}
-            mask = df['连锁品牌'].str.len() > 1
-            if mask.any():
-                chain_groups = df[mask].groupby('连锁品牌').groups
+            # 只有当 '连锁品牌' 列存在时才处理
+            if '连锁品牌' in df.columns:
+                mask = df['连锁品牌'].str.len() > 1
+                if mask.any():
+                    chain_groups = df[mask].groupby('连锁品牌').groups
             
             return df, prov_groups, city_groups, dist_groups, chain_groups
         except Exception as e:
@@ -140,67 +174,78 @@ def smart_map_columns(client, df_user):
 
 def get_candidates_hierarchical(search_name, chain_name, df_master, prov_groups, city_groups, dist_groups, chain_groups, user_row, mapping):
     """
-    🌟 策略核心：先根据地理位置圈定范围，再在范围内找。
+    🌟 策略升级 V2 (核心词包含 + 宽范围)：
+    1. 确定最宽的地理边界 (City > Prov > All)。
+    2. 在地理边界内，进行【核心词包含搜索】 (Keyword Contains)。
+    3. 结合原有的区县精准匹配。
     """
     try:
         u_prov = str(user_row[mapping['prov']]) if mapping['prov'] and pd.notna(user_row[mapping['prov']]) else ''
         u_city = str(user_row[mapping['city']]) if mapping['city'] and pd.notna(user_row[mapping['city']]) else ''
         u_dist = str(user_row[mapping['dist']]) if mapping['dist'] and pd.notna(user_row[mapping['dist']]) else ''
         
-        target_indices = set()
+        candidates_indices = set()
+        scope_indices = set() # 搜索底池
         scope_desc = ""
 
-        # --- 1. 地理圈人 (Geographic Fencing) ---
-        if u_dist and u_dist in dist_groups:
-            dist_indices = set(dist_groups[u_dist])
-            # 如果有城市信息，做交集验证（防止同名区，如“城关区”）
-            if u_city and u_city in city_groups:
-                city_indices = set(city_groups[u_city])
-                intersection = dist_indices.intersection(city_indices)
-                target_indices = intersection if intersection else dist_indices
-                scope_desc = f"精准区域: {u_city}{u_dist}"
-            else:
-                target_indices = dist_indices
-                scope_desc = f"区域: {u_dist}"
-        
-        elif u_city and u_city in city_groups:
-            target_indices = set(city_groups[u_city])
+        # --- 1. 确定搜索底池 (Search Scope) ---
+        if u_city and u_city in city_groups:
+            scope_indices = set(city_groups[u_city])
             scope_desc = f"城市: {u_city}"
-            
         elif u_prov and u_prov in prov_groups:
-            target_indices = set(prov_groups[u_prov])
+            scope_indices = set(prov_groups[u_prov])
             scope_desc = f"省份: {u_prov}"
-            
         else:
-            target_indices = set(df_master.index)
+            # 如果没有省市信息，底池就是全国 (注意性能)
+            scope_indices = set(df_master.index)
             scope_desc = "全国范围"
 
-        # --- 2. 连锁下钻 (Chain Drill-down) ---
-        # 如果找到了地理范围，且用户有连锁名，我们强制把该区域内该连锁的所有店都拉进来
-        # 即使名字匹配度低，也要拉进来给 AI 看地址
-        force_chain_indices = set()
+        # --- 2. 核心词召回 (Keyword Recall) ---
+        # 提取核心词，例如 "同仁堂药店" -> "同仁堂"
+        core_word = extract_core_keywords(search_name)
+        
+        # 只有核心词有效且底池存在时
+        if len(core_word) >= 2 and scope_indices:
+            current_scope_list = list(scope_indices)
+            
+            # 如果是全国范围且数据量极大，这里为了性能可能需要限制，但为了查全率我们先不做硬限制
+            # 优化：只在 Scope 范围内切片
+            if len(current_scope_list) > 0:
+                scope_df_slice = df_master.loc[current_scope_list]
+                
+                # 【关键一步】包含匹配：只要标准名称包含核心词，就拉进来
+                keyword_mask = scope_df_slice['标准名称'].astype(str).str.contains(core_word, regex=False, na=False)
+                keyword_indices = set(scope_df_slice[keyword_mask].index)
+                
+                candidates_indices.update(keyword_indices)
+        
+        # --- 3. 原有的地理层级补全 (Geographic Hierarchy) ---
+        # 核心词可能提取不准，保留原有逻辑作为补充
+        if u_dist and u_dist in dist_groups:
+            dist_indices = set(dist_groups[u_dist])
+            if u_city and u_city in city_groups:
+                dist_indices = dist_indices.intersection(set(city_groups[u_city]))
+            
+            # 只有当候选池还很空的时候，才把整个区的医院都加进去
+            if len(candidates_indices) < 5:
+                candidates_indices.update(dist_indices)
+
+        # --- 4. 连锁下钻 (Chain Drill-down) ---
         if chain_name and chain_name in chain_groups:
             chain_indices = set(chain_groups[chain_name])
-            force_chain_indices = chain_indices.intersection(target_indices)
+            valid_chain = chain_indices.intersection(scope_indices)
+            candidates_indices.update(valid_chain)
 
-        # --- 3. 候选合成 ---
-        candidates_indices = set()
-        candidates_indices.update(force_chain_indices) 
-        
-        # 如果还没找到或者需要更多模糊候选项
-        if target_indices:
-            search_pool = list(target_indices)
-            # 安全切片：如果池子太大，且已经有连锁候选，就少搜点全局
-            if len(search_pool) > 3000 and len(force_chain_indices) > 0:
-                 search_pool = search_pool[:1000] 
-
-            current_scope_df = df_master.loc[search_pool]
-            choices = current_scope_df['标准名称'].fillna('').astype(str).to_dict()
-            
-            # 模糊搜索前 5 名补充进去
-            results = process.extract(search_name, choices, limit=5, scorer=fuzz.WRatio)
-            for r in results:
-                candidates_indices.add(r[2])
+        # --- 5. 模糊搜索兜底 ---
+        if len(candidates_indices) < 3 and list(scope_indices):
+             # 限制搜索池大小
+             search_pool_list = list(scope_indices)
+             if len(search_pool_list) > 3000: search_pool_list = search_pool_list[:3000]
+             
+             choices = df_master.loc[search_pool_list, '标准名称'].fillna('').astype(str).to_dict()
+             results = process.extract(search_name, choices, limit=3, scorer=fuzz.WRatio)
+             for r in results:
+                 candidates_indices.add(r[2])
 
         return list(candidates_indices), scope_desc
     
@@ -366,18 +411,17 @@ elif st.session_state.mapping_confirmed and not st.session_state.prep_done:
             if sort_cols:
                 df_safe = df_safe.sort_values(by=sort_cols).reset_index(drop=True)
 
-            # 3. 向量化全字匹配
+            # 3. 向量化全字匹配 (新版：全库匹配)
+            # 直接建立 {标准名称: Metadata} 字典，不考虑地理因素
             master_exact = df_master.drop_duplicates(subset=['标准名称']).set_index('标准名称').to_dict('index')
             
             def check_exact(row):
-                raw = row[mapping['name']]
-                chain = row[mapping['chain']] if mapping['chain'] else ""
-                search = raw
-                if chain and chain not in raw: search = f"{chain} {raw}"
+                raw_name = str(row[mapping['name']]).strip()
+                # 只有全库完全一致才算 Exact Match
+                if raw_name in master_exact:
+                    m = master_exact[raw_name]
+                    return pd.Series([True, m.get('esid'), raw_name, m.get('机构类型'), "High", "全字匹配", "全库精确命中"])
                 
-                if search in master_exact:
-                    m = master_exact[search]
-                    return pd.Series([True, m.get('esid'), search, m.get('机构类型'), "High", "全字匹配", "精确命中"])
                 return pd.Series([False, None, None, None, None, None, None])
 
             match_results = df_safe.apply(check_exact, axis=1)
@@ -411,10 +455,6 @@ elif st.session_state.mapping_confirmed and not st.session_state.prep_done:
 
 # --- 3. 任务执行与监控 ---
 elif st.session_state.prep_done and not st.session_state.final_result_df is not None:
-    # 这里处理还没跑完，或者还没开始跑的情况
-    # 如果已经有结果了(final_result_df not None)，就去结果页
-    # 如果还没有，就在这里
-    
     # 还没点开始
     if not st.session_state.is_running and len(st.session_state.accumulated_results) == 0:
         count_exact = len(st.session_state.df_exact)
@@ -474,7 +514,7 @@ elif st.session_state.prep_done and not st.session_state.final_result_df is not 
                     row_with_meta = row.copy()
                     if mapping['addr']: row_with_meta['地址列_raw'] = str(row[mapping['addr']])
 
-                    # 1. 策略升级：分层检索
+                    # 1. 策略升级：V2 核心词包含检索
                     indices, scope_desc = get_candidates_hierarchical(
                         search_name, chain_name, df_master, 
                         prov_groups, city_groups, dist_groups, chain_groups, 
@@ -496,7 +536,7 @@ elif st.session_state.prep_done and not st.session_state.final_result_df is not 
                             base_res.update({"匹配ESID": None, "匹配标准名": None, "机构类型": None, "置信度": "Low", "匹配方式": "无结果", "理由": "索引异常"})
                             st.session_state.match_stats['no_match'] += 1
                         else:
-                            # 2. 策略升级：V4 Prompt (含地址交叉验证)
+                            # 2. V4 Prompt 
                             ai_res = ai_match_row_v4(client, row_with_meta, search_name, chain_name, scope_desc, candidates)
                             if isinstance(ai_res, list): ai_res = ai_res[0] if ai_res else {}
                             
@@ -589,6 +629,3 @@ if st.session_state.final_result_df is not None:
     
     csv = df_show.to_csv(index=False).encode('utf-8-sig')
     st.download_button("📥 下载结果文件", csv, "linkmed_final_result.csv", "text/csv", type="primary")
-
-
-
