@@ -177,13 +177,13 @@ def ai_deep_match(client, row, candidates_df, search_name):
     【判断准则】:
     1. 优先检查地址：如果候选列表中的地址与原始地址路名、门牌号高度重合，置信度设为 High。
     2. 识别简称：识别待匹配项是否为候选标准名的缩写。
-    3. 排除法：严禁匹配到不同城市的同名医院。
+    3. 排除法：严禁匹配到不同省份的同名医院。
+    4. 同省份不同城市，但是同名可能是同一家医院
     
     【输出 JSON】:
     {{ "match_esid": "ESID", "match_name": "标准名称", "confidence": "High/Mid/Low", "reason": "匹配逻辑简述" }}
     """
-    # 此处可改为 gemini-1.5-pro 以获取更高智能
-    return safe_generate(client, prompt, model_name="gemini-2.0-flash-exp")
+    return safe_generate(client, prompt, model_name="gemini-3-pro-preview")
 
 def smart_map_columns(client, df_user):
     user_cols = df_user.columns.tolist()
@@ -519,4 +519,5 @@ if st.session_state.final_result_df is not None:
     
     csv = df_show.to_csv(index=False).encode('utf-8-sig')
     st.download_button("📥 下载结果文件", csv, "linkmed_final_result.csv", "text/csv", type="primary")
+
 
