@@ -9,6 +9,37 @@ import re
 from google import genai
 from google.genai import types
 from rapidfuzz import process, fuzz 
+import streamlit.components.v1 as components
+
+# 在页面配置后添加这段 JS
+components.html(
+    """
+    <script>
+    let wakeLock = null;
+
+    // 请求唤醒锁
+    async function requestWakeLock() {
+      try {
+        wakeLock = await navigator.wakeLock.request('screen');
+        console.log('Wake Lock is active');
+      } catch (err) {
+        console.error(`${err.name}, ${err.message}`);
+      }
+    }
+
+    // 只要页面加载就尝试锁定
+    requestWakeLock();
+
+    // 如果页面可见性改变（比如切换标签页又回来），重新申请
+    document.addEventListener('visibilitychange', async () => {
+      if (wakeLock !== null && document.visibilityState === 'visible') {
+        await requestWakeLock();
+      }
+    });
+    </script>
+    """,
+    height=0,
+)
 
 # ================= 1. 配置与初始化 =================
 
@@ -519,5 +550,6 @@ if st.session_state.final_result_df is not None:
     
     csv = df_show.to_csv(index=False).encode('utf-8-sig')
     st.download_button("📥 下载结果文件", csv, "linkmed_final_result.csv", "text/csv", type="primary")
+
 
 
